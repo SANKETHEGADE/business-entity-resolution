@@ -18,7 +18,8 @@ from .features import FEATURE_ORDER
 @dataclass
 class MatchModel:
     threshold: float = 0.65
-    margin: float = 0.15
+    margin: float = 0.12
+    confidence_hurdle: float = 0.72
     clf: Optional[lgb.LGBMClassifier] = None
 
     def __post_init__(self):
@@ -53,16 +54,18 @@ class MatchModel:
         entity_candidates_scores: Dict[str, List[Tuple[str, float]]],
         threshold: Optional[float] = None,
         margin: Optional[float] = None,
+        confidence_hurdle: Optional[float] = None,
     ) -> Dict[str, List[str]]:
-        """Apply precision-heavy relative margin decision policy per Source-1 entity.
+        """Singleton-Gated Calibrated Margin Decision Policy.
 
-        Keeps candidate if:
-        1. prob >= threshold
-        2. prob >= (max_prob_for_entity - margin)
-        If no candidate exceeds threshold, entity is treated as a singleton (returns empty list).
+        1. Absolute Confidence Hurdle: If max probability for an entity < confidence_hurdle,
+           immediately emit [] (protects 1.0 score for singletons).
+        2. Calibrated Margin: For entities that pass the hurdle, retain candidates
+           with prob >= threshold AND prob >= (max_prob - margin).
         """
         th = self.threshold if threshold is None else threshold
         mg = self.margin if margin is None else margin
+        hurdle = self.confidence_hurdle if confidence_hurdle is None else confidence_hurdle
 
         predictions: Dict[str, List[str]] = {}
 
@@ -72,8 +75,8 @@ class MatchModel:
                 continue
 
             max_score = max(score for _, score in cand_scores)
-            if max_score < th:
-                # Singleton protection: no candidate is confident enough
+            # Absolute confidence hurdle (singleton protection)
+            if max_score < hurdle:
                 predictions[s1_id] = []
                 continue
 

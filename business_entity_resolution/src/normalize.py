@@ -76,8 +76,13 @@ STREET_ABBREV_MAP = {
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
-_DOMAIN_RE = re.compile(r"^(?:https?://)?(?:www\.)?([a-zA-Z0-9\-\.]+)\.(?:com|in|org|net|fr|co\.in|co|io|biz|info)(?:/.*)?$", re.IGNORECASE)
+_DOMAIN_RE = re.compile(r"^(?:https?://)?(?:www\.)?([^/]+).*", re.IGNORECASE)
 _NUMERIC_RE = re.compile(r"\b\d+\b")
+_POSTAL_GENERIC_RE = re.compile(r"\b\d{5,6}\b")
+_POSTAL_US_RE = re.compile(r"\b\d{5}(?:-\d{4})?\b")
+_POSTAL_IN_RE = re.compile(r"\b[1-9][0-9]{5}\b")
+_POSTAL_FR_RE = re.compile(r"\b(?:0[1-9]|[1-8]\d|9[0-8])\d{3}\b")
+_CEDEX_RE = re.compile(r"\b(?:cedex|bp)(?:\s+\d+)?\b", re.IGNORECASE)
 
 
 def basic_clean(text: Optional[str]) -> str:
@@ -93,13 +98,14 @@ def basic_clean(text: Optional[str]) -> str:
 
 
 def clean_domain_name(name: Optional[str]) -> str:
-    """If the business name is structured as a URL/domain name, extract and clean the core token."""
+    """Strip protocol, www, paths, and common TLDs (.com, .in, .fr, .org, .net)."""
     if not name:
         return ""
-    trimmed = name.strip()
+    trimmed = str(name).strip()
     match = _DOMAIN_RE.match(trimmed)
-    if match:
+    if match and ("." in trimmed or "/" in trimmed):
         core = match.group(1)
+        core = re.sub(r"\.(?:com|in|org|net|fr|co\.in|co|io|biz|info|gouv\.fr)$", "", core, flags=re.IGNORECASE)
         core = re.sub(r"[\.\-_]", " ", core)
         return basic_clean(core)
     return basic_clean(name)
@@ -132,6 +138,16 @@ def extract_numeric_tokens(text: Optional[str]) -> Set[str]:
     if not text:
         return set()
     return set(_NUMERIC_RE.findall(str(text)))
+
+
+def extract_postal_tokens(text: Optional[str]) -> Set[str]:
+    """Extract 5-6 digit postal codes (US zip, India PIN, France Code Postal, CEDEX)."""
+    if not text:
+        return set()
+    raw = str(text)
+    postals = set(_POSTAL_GENERIC_RE.findall(raw))
+    postals.update(_CEDEX_RE.findall(raw.lower()))
+    return postals
 
 
 def name_tokens(name: Optional[str], min_len: int = 2) -> Set[str]:

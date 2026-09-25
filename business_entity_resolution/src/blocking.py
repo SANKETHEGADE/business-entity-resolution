@@ -84,9 +84,10 @@ def generate_candidates(
     name_col: str,
     addr_col: str = "business_address",
     country_col: str = "country",
-    top_k: int = 25,
+    top_k: int = 8,
+    tau_block: float = 2.0,
 ) -> Dict[str, Set[str]]:
-    """Generate high-probability candidate set bounded to top_k per S1 entity."""
+    """Generate high-probability candidate set with adaptive candidate pruning (target avg: 2-5)."""
     actual_addr_col = addr_col if addr_col in other_df.columns else "business_address"
     actual_country_col = country_col if country_col in other_df.columns else "country"
 
@@ -109,55 +110,75 @@ def generate_candidates(
         s1_tokens = set(norm_name.split()) if norm_name else set()
         s1_addr_tokens = normalize.address_tokens(raw_addr)
         s1_numbers = normalize.extract_numeric_tokens(raw_addr)
+        s1_postals = normalize.extract_postal_tokens(raw_addr)
         s1_country = (raw_country or "").strip().casefold()
 
         pool_scores: Counter = Counter()
 
-        # Channel 1: Rare Name Token hits
+        # Channel 1: High-IDF Name Tokens
         for t in s1_tokens:
             if t in name_idx:
                 for cand_id in name_idx[t]:
                     pool_scores[cand_id] += 3.0
 
-        # Channel 2: Character 3-grams if token matching is sparse
+        # Channel 2: Character 3-grams for typo tolerance on significant words (len >= 5)
         for t in s1_tokens:
             if len(t) >= 5:
                 for i in range(len(t) - 2):
                     shingle = t[i : i + 3]
                     if shingle in ngram_idx:
                         for cand_id in ngram_idx[shingle]:
-                            pool_scores[cand_id] += 0.2
+                            pool_scores[cand_id] += 0.25
 
-        # Channel 3: Address Anchors (numbers / postal codes)
-        for num in s1_numbers:
+        # Channel 3: Numeric / Postal Co-occurrence
+        all_numeric_anchors = s1_numbers | s1_postals
+        for num in all_numeric_anchors:
             key = f"num:{num}"
             if key in addr_idx:
                 for cand_id in addr_idx[key]:
-                    pool_scores[cand_id] += 1.5
+                    pool_scores[cand_id] += 1.8
 
         if not pool_scores:
             candidates[s1_id] = set()
             continue
 
-        # Filter candidates: apply country compatibility and address consistency bonus
+        # Country Partitioning & Address Overlap Scoring
         scored_candidates = []
         for cand_id, score in pool_scores.items():
             cmeta = other_records[cand_id]
-            # Country penalty/bonus:
+            # Country Partition: Only compare where country matches or either is missing
             if s1_country and cmeta["country"]:
                 if s1_country != cmeta["country"]:
-                    continue  # Hard drop across conflicting known countries
+                    continue  # Hard drop conflicting known countries
 
             # Address token overlap bonus
             common_addr = s1_addr_tokens & cmeta["addr_tokens"]
             if common_addr:
-                score += len(common_addr) * 1.0
+                score += len(common_addr) * 1.2
 
             scored_candidates.append((score, cand_id))
 
-        # Sort by preliminary overlap score descending and cap at top_k
+        if not scored_candidates:
+            candidates[s1_id] = set()
+            continue
+
+        # Adaptive Candidate Pruner:
+        # Sort descending by preliminary score
         scored_candidates.sort(key=lambda x: x[0], reverse=True)
-        top_cand_ids = {cand_id for score, cand_id in scored_candidates[:top_k] if score >= 1.0}
+        max_score = scored_candidates[0][0]
+
+        # If no candidate passes the blocking hurdle, output 0 candidates (saves singletons!)
+        if max_score < tau_block:
+            candidates[s1_id] = set()
+            continue
+
+        # Dynamic relative threshold: only keep candidates within 40% of the top score
+        dynamic_floor = max(tau_block, max_score * 0.40)
+        top_cand_ids = {
+            cand_id
+            for score, cand_id in scored_candidates[:top_k]
+            if score >= dynamic_floor
+        }
 
         candidates[s1_id] = top_cand_ids
 

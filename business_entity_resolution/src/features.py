@@ -1,42 +1,45 @@
 """Pairwise similarity features for candidate pairs.
 
 Owner: feat/features.
-Computes comprehensive string, token, character-ngram, numeric/postal,
-and optional sentence-embedding cosine similarities across (Source 1, Candidate).
+Computes 18-22 dense tabular features per candidate pair matching the Top-100 blueprint:
+- Name Match Signals: Exact match, RapidFuzz ratios (ratio, partial, token_sort, token_set),
+  Jaro-Winkler similarity, length difference ratio.
+- Address Signals: Numeric token Jaccard, token sort ratio, common street number match boolean.
+- Structural & Missingness Indicators: Missing name flag, missing address flag, source indicator (S2=1, S3=0).
+- Cross-country match status (1.0 if matching or unknown, 0.0 if conflicting).
+- Optional frozen all-MiniLM-L6-v2 embedding cosine similarity.
 """
 from typing import Dict, List, Optional, Set
 import numpy as np
 from rapidfuzz import fuzz
+from rapidfuzz.distance import JaroWinkler
 
 from . import normalize
 
 FEATURE_ORDER: List[str] = [
-    # Name features
+    # Name Match Signals
     "name_exact_match",
     "name_base_exact_match",
     "name_fuzzy_ratio",
+    "name_partial_ratio",
     "name_token_sort_ratio",
     "name_token_set_ratio",
-    "name_partial_ratio",
+    "name_jaro_winkler",
+    "name_len_diff_ratio",
     "name_token_jaccard",
     "name_char3_jaccard",
-    "name_len_diff",
-    "name_len_ratio",
-    "name_is_substring",
-    "name_missing",
-    # Address features
-    "addr_fuzzy_ratio",
-    "addr_token_sort_ratio",
-    "addr_token_set_ratio",
-    "addr_token_jaccard",
+    # Address Signals
     "addr_numeric_jaccard",
-    "addr_numeric_common_count",
+    "addr_token_sort_ratio",
+    "addr_fuzzy_ratio",
+    "common_street_number_match",
+    # Structural & Missingness Indicators
+    "name_missing",
     "addr_missing",
-    # Country & Metadata
-    "country_match",
     "is_s2",
-    "is_s3",
-    # Embedding cosine features (frozen all-MiniLM-L6-v2)
+    # Country Compatibility
+    "country_match",
+    # Optional Semantic Neural Features
     "name_emb_cosine",
     "addr_emb_cosine",
 ]
@@ -65,8 +68,8 @@ def pair_features(
     emb_name_sim: float = 0.0,
     emb_addr_sim: float = 0.0,
 ) -> Dict[str, float]:
-    """Compute rich pairwise feature vector between Source 1 entity and a candidate."""
-    # 1. Normalized variants
+    """Compute dense 18-22 tabular features between Source 1 entity and a candidate."""
+    # 1. Normalized strings
     norm_name_a = normalize.normalize_name(name_a, strip_suffixes=False)
     norm_name_b = normalize.normalize_name(name_b, strip_suffixes=False)
 
@@ -76,70 +79,69 @@ def pair_features(
     norm_addr_a = normalize.normalize_address(addr_a)
     norm_addr_b = normalize.normalize_address(addr_b)
 
-    # 2. Missing flags
+    # 2. Missingness Indicators
     name_missing = float(not norm_name_a or not norm_name_b)
     addr_missing = float(not norm_addr_a or not norm_addr_b)
 
-    # 3. Name features
+    # 3. Name Match Signals
+    len_a = len(norm_name_a)
+    len_b = len(norm_name_b)
+    max_len = max(len_a, len_b)
+    len_diff_ratio = abs(len_a - len_b) / max_len if max_len > 0 else 0.0
+
     toks_a = normalize.name_tokens(name_a)
     toks_b = normalize.name_tokens(name_b)
 
     char3_a = _char_ngrams(norm_name_a, 3)
     char3_b = _char_ngrams(norm_name_b, 3)
 
-    len_a = len(norm_name_a)
-    len_b = len(norm_name_b)
-    len_diff = abs(len_a - len_b)
-    len_ratio = min(len_a, len_b) / max(len_a, len_b) if max(len_a, len_b) > 0 else 0.0
+    jw_sim = JaroWinkler.similarity(norm_name_a, norm_name_b) if norm_name_a and norm_name_b else 0.0
 
-    is_substring = 0.0
-    if len_a >= 3 and len_b >= 3:
-        if norm_name_a in norm_name_b or norm_name_b in norm_name_a:
-            is_substring = 1.0
-
-    # 4. Address & Numeric features
+    # 4. Address & Numeric Signals
     nums_a = normalize.extract_numeric_tokens(addr_a)
     nums_b = normalize.extract_numeric_tokens(addr_b)
-    common_nums = nums_a & nums_b
+    numeric_jaccard = _jaccard(nums_a, nums_b)
 
-    addr_toks_a = normalize.address_tokens(addr_a)
-    addr_toks_b = normalize.address_tokens(addr_b)
+    # Check common street number match (e.g., first number in address)
+    common_street_number = 0.0
+    if nums_a and nums_b:
+        first_num_a = next(iter(nums_a))
+        first_num_b = next(iter(nums_b))
+        if first_num_a == first_num_b:
+            common_street_number = 1.0
+        elif nums_a & nums_b:
+            common_street_number = 1.0
 
-    # 5. Country compatibility (open set: US, India, France, etc.)
+    # 5. Cross-country match status (1.0 if matching or unknown, 0.0 if conflicting)
     c_a = (country_a or "").strip().casefold()
     c_b = (country_b or "").strip().casefold()
     if not c_a or not c_b:
-        country_match = 1.0  # unknown country is neutral
+        country_match = 1.0
     else:
         country_match = 1.0 if c_a == c_b else 0.0
 
-    # 6. Source identifier
+    # 6. Source indicator: 1 if candidate is from S2, 0 if from S3
     is_s2 = 1.0 if cand_id.startswith("S2-") else 0.0
-    is_s3 = 1.0 if cand_id.startswith("S3-") else 0.0
 
     return {
         "name_exact_match": float(norm_name_a == norm_name_b and bool(norm_name_a)),
         "name_base_exact_match": float(base_name_a == base_name_b and bool(base_name_a)),
         "name_fuzzy_ratio": fuzz.ratio(norm_name_a, norm_name_b) / 100.0,
+        "name_partial_ratio": fuzz.partial_ratio(norm_name_a, norm_name_b) / 100.0,
         "name_token_sort_ratio": fuzz.token_sort_ratio(norm_name_a, norm_name_b) / 100.0,
         "name_token_set_ratio": fuzz.token_set_ratio(norm_name_a, norm_name_b) / 100.0,
-        "name_partial_ratio": fuzz.partial_ratio(norm_name_a, norm_name_b) / 100.0,
+        "name_jaro_winkler": float(jw_sim),
+        "name_len_diff_ratio": float(len_diff_ratio),
         "name_token_jaccard": _jaccard(toks_a, toks_b),
         "name_char3_jaccard": _jaccard(char3_a, char3_b),
-        "name_len_diff": float(len_diff),
-        "name_len_ratio": float(len_ratio),
-        "name_is_substring": is_substring,
-        "name_missing": name_missing,
-        "addr_fuzzy_ratio": fuzz.ratio(norm_addr_a, norm_addr_b) / 100.0,
+        "addr_numeric_jaccard": numeric_jaccard,
         "addr_token_sort_ratio": fuzz.token_sort_ratio(norm_addr_a, norm_addr_b) / 100.0,
-        "addr_token_set_ratio": fuzz.token_set_ratio(norm_addr_a, norm_addr_b) / 100.0,
-        "addr_token_jaccard": _jaccard(addr_toks_a, addr_toks_b),
-        "addr_numeric_jaccard": _jaccard(nums_a, nums_b),
-        "addr_numeric_common_count": float(len(common_nums)),
+        "addr_fuzzy_ratio": fuzz.ratio(norm_addr_a, norm_addr_b) / 100.0,
+        "common_street_number_match": common_street_number,
+        "name_missing": name_missing,
         "addr_missing": addr_missing,
-        "country_match": country_match,
         "is_s2": is_s2,
-        "is_s3": is_s3,
+        "country_match": country_match,
         "name_emb_cosine": float(emb_name_sim),
         "addr_emb_cosine": float(emb_addr_sim),
     }

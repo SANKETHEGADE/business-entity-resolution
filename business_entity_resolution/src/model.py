@@ -2,9 +2,9 @@
 
 Owner: feat/model.
 Uses LightGBM (MIT licensed, efficient, tabular powerhouse) with:
-1. Macro F0.5-optimized threshold selection.
-2. Per-entity relative margin pruning.
-3. Singleton preservation policy.
+1. Top-100 blueprint hyperparameters (n_estimators=1000, lr=0.03, max_depth=6, subsample=0.8).
+2. 2D grid search over (threshold θ ∈ [0.50, 0.85], margin δ ∈ [0.05, 0.20]) to maximize Macro F_0.5.
+3. Singleton-Gated Calibrated Margin policy.
 """
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -18,16 +18,17 @@ from .features import FEATURE_ORDER
 @dataclass
 class MatchModel:
     threshold: float = 0.65
-    margin: float = 0.12
+    margin: float = 0.10
     confidence_hurdle: float = 0.72
     clf: Optional[lgb.LGBMClassifier] = None
 
     def __post_init__(self):
         if self.clf is None:
             self.clf = lgb.LGBMClassifier(
-                n_estimators=150,
-                learning_rate=0.05,
-                num_leaves=31,
+                n_estimators=1000,
+                learning_rate=0.03,
+                max_depth=6,
+                subsample=0.8,
                 random_state=42,
                 class_weight="balanced",
                 n_jobs=-1,
@@ -56,12 +57,12 @@ class MatchModel:
         margin: Optional[float] = None,
         confidence_hurdle: Optional[float] = None,
     ) -> Dict[str, List[str]]:
-        """Singleton-Gated Calibrated Margin Decision Policy.
+        """Decision Rule from Blueprint: Candidate i is retained if:
 
-        1. Absolute Confidence Hurdle: If max probability for an entity < confidence_hurdle,
-           immediately emit [] (protects 1.0 score for singletons).
-        2. Calibrated Margin: For entities that pass the hurdle, retain candidates
-           with prob >= threshold AND prob >= (max_prob - margin).
+            P_i >= theta   AND   (max_j P_j - P_i) <= delta
+
+        Plus Absolute Confidence Hurdle (singleton protection):
+        If max_j P_j < hurdle, entity is immediately emitted as an empty list.
         """
         th = self.threshold if threshold is None else threshold
         mg = self.margin if margin is None else margin
@@ -83,32 +84,45 @@ class MatchModel:
             selected = [
                 cand_id
                 for cand_id, score in cand_scores
-                if score >= th and score >= (max_score - mg)
+                if score >= th and (max_score - score) <= mg
             ]
             predictions[s1_id] = selected
 
         return predictions
 
-    def tune_threshold(
+    def tune_threshold_2d(
         self,
         entity_candidates_scores: Dict[str, List[Tuple[str, float]]],
         ground_truth: Dict[str, Set[str]],
-        threshold_candidates: Optional[Iterable[float]] = None,
-    ) -> Tuple[float, float]:
-        """Grid search decision threshold to maximize macro F_0.5 score."""
-        if threshold_candidates is None:
-            threshold_candidates = [round(x, 2) for x in np.arange(0.35, 0.90, 0.05)]
+        theta_range: Optional[Iterable[float]] = None,
+        delta_range: Optional[Iterable[float]] = None,
+    ) -> Tuple[float, float, float]:
+        """2D Grid Search over threshold θ ∈ [0.30, 0.85] and margin δ ∈ [0.05, 0.20]."""
+        if theta_range is None:
+            theta_range = [round(x, 2) for x in np.arange(0.30, 0.86, 0.02)]
+        if delta_range is None:
+            delta_range = [round(x, 2) for x in np.arange(0.05, 0.21, 0.02)]
 
-        best_th = self.threshold
+        best_theta = self.threshold
+        best_delta = self.margin
         best_score = -1.0
 
-        for th in threshold_candidates:
-            preds = self.predict_for_entities(entity_candidates_scores, threshold=th, margin=self.margin)
-            score_dict = evaluate.macro_f0_5(preds, ground_truth)
-            f_score = float(score_dict["macro_f0_5"])
-            if f_score > best_score:
-                best_score = f_score
-                best_th = th
+        for th in theta_range:
+            for delta in delta_range:
+                preds = self.predict_for_entities(
+                    entity_candidates_scores,
+                    threshold=th,
+                    margin=delta,
+                    confidence_hurdle=th,
+                )
+                score_dict = evaluate.macro_f0_5(preds, ground_truth)
+                f_score = float(score_dict["macro_f0_5"])
+                if f_score > best_score:
+                    best_score = f_score
+                    best_theta = th
+                    best_delta = delta
 
-        self.threshold = best_th
-        return best_th, best_score
+        self.threshold = best_theta
+        self.margin = best_delta
+        self.confidence_hurdle = best_theta
+        return best_theta, best_delta, best_score

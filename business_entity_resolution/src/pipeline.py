@@ -5,7 +5,8 @@ Usage:
     python -m src.pipeline --split test
 """
 import argparse
-from typing import Dict, List, Set, Tuple
+import random
+from typing import Dict, List, Optional, Set, Tuple
 import pandas as pd
 from tqdm import tqdm
 
@@ -29,12 +30,13 @@ def build_pair_dataset(
     candidates: Dict[str, Set[str]],
     other_records: Dict[str, dict],
     ground_truth: Dict[str, Set[str]] = None,
+    max_neg_ratio: Optional[float] = None,
 ) -> Tuple[List[dict], List[int], Dict[str, List[str]]]:
-    """Featurize all (Source 1, Candidate) pairs."""
+    """Featurize all (Source 1, Candidate) pairs with optional hard negative subsampling."""
     s1_records = extract_record_maps(s1_df)
 
-    feat_dicts: List[dict] = []
-    labels: List[int] = []
+    pos_features: List[dict] = []
+    neg_features: List[dict] = []
     pair_index: Dict[str, List[str]] = {}
 
     for s1_id in s1_df[config.COL_ENTITY_ID]:
@@ -58,11 +60,27 @@ def build_pair_dataset(
                 country_b=cand_meta["country"],
                 cand_id=cand_id,
             )
-            feat_dicts.append(fd)
-            if ground_truth is not None:
-                labels.append(1 if cand_id in true_matches else 0)
 
-    return feat_dicts, labels, pair_index
+            if ground_truth is not None:
+                if cand_id in true_matches:
+                    pos_features.append(fd)
+                else:
+                    neg_features.append(fd)
+            else:
+                pos_features.append(fd)
+
+    if ground_truth is not None:
+        if max_neg_ratio is not None and pos_features:
+            max_negs = int(len(pos_features) * max_neg_ratio)
+            if len(neg_features) > max_negs:
+                random.seed(config.RANDOM_SEED)
+                neg_features = random.sample(neg_features, max_negs)
+
+        all_features = pos_features + neg_features
+        labels = [1] * len(pos_features) + [0] * len(neg_features)
+        return all_features, labels, pair_index
+
+    return pos_features, [0] * len(pos_features), pair_index
 
 
 def run_train(sample: bool = False) -> None:
@@ -87,7 +105,7 @@ def run_train(sample: bool = False) -> None:
 
     print(f"Data loaded: S1={len(s1)}, S2={len(s2)}, S3={len(s3)}, GT={len(ground_truth)}")
 
-    # 1. Train/Validation Split (80/20 by Source 1 entity_id hash to prevent leakage)
+    # 1. 80/20 Entity-disjoint split
     val_mask = s1[config.COL_ENTITY_ID].apply(lambda x: hash(x) % 5 == 0)
     train_s1 = s1[~val_mask].copy()
     val_s1 = s1[val_mask].copy()
@@ -98,10 +116,10 @@ def run_train(sample: bool = False) -> None:
     # 2. Blocking on Train S1
     print("Generating candidates for training set...")
     cand_s2 = blocking.generate_candidates(
-        train_s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY, top_k=25
+        train_s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
     )
     cand_s3 = blocking.generate_candidates(
-        train_s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY, top_k=25
+        train_s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
     )
     train_candidates = {
         s1_id: cand_s2.get(s1_id, set()) | cand_s3.get(s1_id, set())
@@ -111,10 +129,10 @@ def run_train(sample: bool = False) -> None:
     # 3. Blocking on Validation S1
     print("Generating candidates for validation set...")
     v_cand_s2 = blocking.generate_candidates(
-        val_s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY, top_k=25
+        val_s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
     )
     v_cand_s3 = blocking.generate_candidates(
-        val_s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY, top_k=25
+        val_s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
     )
     val_candidates = {
         s1_id: v_cand_s2.get(s1_id, set()) | v_cand_s3.get(s1_id, set())
@@ -125,16 +143,20 @@ def run_train(sample: bool = False) -> None:
     print(f"Validation Blocking Recall Ceiling: {val_recall * 100:.2f}% (Avg candidates/S1: {val_avg_cands:.1f})")
 
     # 4. Feature Extraction
-    print("Featurizing training candidate pairs...")
+    print("Featurizing training candidate pairs (subsampling negatives at 1:6 ratio)...")
     other_records = {**extract_record_maps(s2), **extract_record_maps(s3)}
-    X_train_dicts, y_train, _ = build_pair_dataset(train_s1, train_candidates, other_records, ground_truth)
+    X_train_dicts, y_train, _ = build_pair_dataset(
+        train_s1, train_candidates, other_records, ground_truth, max_neg_ratio=6.0
+    )
     print(f"  Train pairs: {len(X_train_dicts)} (Positives: {sum(y_train)}, Negatives: {len(y_train) - sum(y_train)})")
 
     print("Featurizing validation candidate pairs...")
-    X_val_dicts, y_val, val_pair_index = build_pair_dataset(val_s1, val_candidates, other_records, ground_truth)
+    X_val_dicts, y_val, val_pair_index = build_pair_dataset(
+        val_s1, val_candidates, other_records, ground_truth, max_neg_ratio=None
+    )
 
     # 5. Train Model
-    print("Training LightGBM Matcher...")
+    print("Training LightGBM Matcher (Top-100 blueprint hyperparameters)...")
     matcher = model.MatchModel()
     matcher.fit(X_train_dicts, y_train)
 
@@ -153,14 +175,18 @@ def run_train(sample: bool = False) -> None:
             idx += 1
         val_entity_scores[s1_id] = scored_pairs
 
-    # 7. Tune Threshold on Validation for Macro F0.5
-    best_th, best_f05 = matcher.tune_threshold(val_entity_scores, val_gt)
+    # 7. 2D Grid Search over (Threshold theta, Margin delta)
+    print("Running 2D grid search over (theta in [0.50, 0.85], delta in [0.05, 0.20]) to maximize Macro F_0.5...")
+    best_th, best_delta, best_f05 = matcher.tune_threshold_2d(val_entity_scores, val_gt)
     print(f"\n==========================================")
-    print(f"Optimal Threshold (Macro F_0.5): {best_th:.2f}")
+    print(f"Optimal Threshold (theta*):      {best_th:.2f}")
+    print(f"Optimal Relative Margin (delta*):{best_delta:.2f}")
     print(f"Validation Macro F_0.5 Score:    {best_f05:.4f}")
     print(f"==========================================")
 
-    val_preds = matcher.predict_for_entities(val_entity_scores, threshold=best_th)
+    val_preds = matcher.predict_for_entities(
+        val_entity_scores, threshold=best_th, margin=best_delta, confidence_hurdle=best_th
+    )
     score_report = evaluate.macro_f0_5(val_preds, val_gt)
     print(f"Singletons in Val: {score_report['n_singletons']} / {score_report['n_entities']}")
 
@@ -189,10 +215,10 @@ def run_test(sample: bool = False) -> None:
     # 1. Blocking on Test
     print("Generating candidates for test set...")
     cand_s2 = blocking.generate_candidates(
-        s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY, top_k=25
+        s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
     )
     cand_s3 = blocking.generate_candidates(
-        s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY, top_k=25
+        s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
     )
     candidates = {
         s1_id: cand_s2.get(s1_id, set()) | cand_s3.get(s1_id, set())
@@ -210,12 +236,12 @@ def run_test(sample: bool = False) -> None:
     tr_s3 = io_utils.read_source(config.TRAIN_FILES["S3"] if config.TRAIN_FILES["S3"].exists() else s3_file)
     tr_gt = io_utils.ground_truth_to_sets(io_utils.read_ground_truth(train_gt_file))
 
-    tr_c2 = blocking.generate_candidates(tr_s1, tr_s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY, top_k=25)
-    tr_c3 = blocking.generate_candidates(tr_s1, tr_s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY, top_k=25)
+    tr_c2 = blocking.generate_candidates(tr_s1, tr_s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+    tr_c3 = blocking.generate_candidates(tr_s1, tr_s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
     tr_cands = {sid: tr_c2.get(sid, set()) | tr_c3.get(sid, set()) for sid in tr_s1[config.COL_ENTITY_ID]}
 
     other_train_records = {**extract_record_maps(tr_s2), **extract_record_maps(tr_s3)}
-    X_train, y_train, _ = build_pair_dataset(tr_s1, tr_cands, other_train_records, tr_gt)
+    X_train, y_train, _ = build_pair_dataset(tr_s1, tr_cands, other_train_records, tr_gt, max_neg_ratio=6.0)
 
     matcher = model.MatchModel()
     matcher.fit(X_train, y_train)
@@ -238,8 +264,13 @@ def run_test(sample: bool = False) -> None:
             idx += 1
         test_entity_scores[s1_id] = scored_pairs
 
-    # Apply precision-heavy thresholding
-    final_matches = matcher.predict_for_entities(test_entity_scores, threshold=0.70)
+    # Apply precision-heavy thresholding with calibrated parameters
+    final_matches = matcher.predict_for_entities(
+        test_entity_scores,
+        threshold=0.65,
+        margin=0.10,
+        confidence_hurdle=0.65,
+    )
     io_utils.write_matching_results(final_matches)
     print(f"Wrote {config.MATCHING_RESULTS_PATH}")
     print("Test pipeline completed successfully!")

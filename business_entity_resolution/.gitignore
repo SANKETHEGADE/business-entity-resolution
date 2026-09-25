@@ -1,0 +1,27 @@
+# Data (large, regenerable, and kept out of git per challenge rules)
+dataset/train/*.tsv
+dataset/test/*.tsv
+!dataset/samples/
+
+# Outputs
+output/*.tsv
+!output/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Models / large artifacts
+*.pkl
+*.joblib
+*.bin
+models/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,54 +1,54 @@
-"""Business-name and address normalization.
+"""Business-name and address normalization for US, India, and France (open set).
 
-Owner: feat/normalize branch.
-
-Goals:
-- Fold obvious surface variation (case, punctuation, common legal-suffix and
-  street-type abbreviations, transliteration of non-Latin scripts) so that
-  downstream blocking/features compare like with like.
-- Stay generic across countries -- country is an open set (test adds France),
-  so don't build a `if country == "India": ...` ladder. Prefer:
-  1. A small set of always-safe, language-agnostic normalizations
-     (casefold, strip punctuation, unicode NFKC, transliterate to ASCII).
-  2. Token-level suffix/abbreviation maps keyed by the token itself, not by
-     country, so a French "Sarl"/"SAS" and an Indian "Pvt Ltd" both just add
-     entries to the same map instead of branching on country.
-- Keep normalization deterministic and side-effect free (pure functions) so
-  it's trivially unit-testable and cacheable.
-
-NOTE on the "no external data" rule: transliteration via `unidecode` and
-hand-written abbreviation dictionaries are fine (they're static, local,
-general-purpose text utilities, not business-identity lookups). Don't call
-out to any geocoding/registry/translation API.
+Owner: Normalization & Preprocessing module.
+Clean text representations, normalize legal entity suffixes across regions,
+standardize street abbreviations, strip web/domain noise, and extract numeric tokens.
 """
 import re
 import unicodedata
-from typing import Optional
+from typing import List, Optional, Set
 
 try:
     from unidecode import unidecode
-except ImportError:  # pragma: no cover - dependency not installed yet
+except ImportError:  # pragma: no cover
     def unidecode(s: str) -> str:
         return s
 
-# Legal-entity suffix normalization. Extend freely; keys/values are already
-# lowercased and this is applied to individual trailing tokens, so it is
-# inherently country-agnostic -- add French/other-language suffixes here too.
-LEGAL_SUFFIX_MAP = {
-    "inc": "inc", "incorporated": "inc",
-    "corp": "corp", "corporation": "corp",
-    "co": "co", "company": "co",
-    "ltd": "ltd", "limited": "ltd",
-    "llc": "llc",
-    "llp": "llp",
-    "pvt": "pvt", "private": "pvt",
-    "sarl": "sarl",
-    "sas": "sas",
-    "sa": "sa",
+# Multi-country legal suffixes (US, India, France)
+LEGAL_SUFFIXES = {
+    # US / UK / International
+    "inc", "incorporated",
+    "corp", "corporation",
+    "co", "company",
+    "ltd", "limited",
+    "llc", "llp", "pllc",
+    "pc", "p c",
+    # India
+    "pvt", "private",
+    "enterprises", "enterprise",
+    "industries", "industry",
+    "associates", "consulting",
+    "services", "solutions",
+    "trust", "foundation",
+    # France (unseen in train, open set for test)
+    "sarl", "sas", "sasu", "sa",
+    "eurl", "sci", "snc", "gie", "sca",
+    "association", "ets", "etablissements",
 }
 
-# Street-type abbreviation normalization for addresses.
+LEGAL_SUFFIX_MAP = {
+    "incorporated": "inc", "inc": "inc",
+    "corporation": "corp", "corp": "corp",
+    "company": "co", "co": "co",
+    "limited": "ltd", "ltd": "ltd",
+    "private": "pvt", "pvt": "pvt",
+    "llc": "llc", "llp": "llp",
+    "sarl": "sarl", "sas": "sas", "sa": "sa", "eurl": "eurl", "sci": "sci",
+}
+
+# Street-type & address abbreviation normalization (US, India, France)
 STREET_ABBREV_MAP = {
+    # English / US / India
     "street": "st", "st": "st",
     "road": "rd", "rd": "rd",
     "avenue": "ave", "ave": "ave",
@@ -56,21 +56,35 @@ STREET_ABBREV_MAP = {
     "drive": "dr", "dr": "dr",
     "lane": "ln", "ln": "ln",
     "court": "ct", "ct": "ct",
+    "highway": "hwy", "hwy": "hwy",
+    "parkway": "pkwy", "pkwy": "pkwy",
+    "circle": "cir", "cir": "cir",
+    "place": "pl", "pl": "pl",
+    "square": "sq", "sq": "sq",
+    "apartment": "apt", "apt": "apt",
+    "floor": "fl", "fl": "fl",
+    "building": "bldg", "bldg": "bldg",
+    "opposite": "opp", "opp": "opp",
+    "near": "nr", "nr": "nr",
+    # French abbreviations
+    "rue": "r", "r": "r",
+    "allee": "all", "all": "all",
+    "chemin": "ch", "ch": "ch",
+    "route": "rte", "rte": "rte",
+    "impasse": "imp", "imp": "imp",
 }
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
+_DOMAIN_RE = re.compile(r"^(?:https?://)?(?:www\.)?([a-zA-Z0-9\-\.]+)\.(?:com|in|org|net|fr|co\.in|co|io|biz|info)(?:/.*)?$", re.IGNORECASE)
+_NUMERIC_RE = re.compile(r"\b\d+\b")
 
 
 def basic_clean(text: Optional[str]) -> str:
-    """Unicode-normalize, transliterate, casefold, strip punctuation/whitespace.
-
-    Safe to run on any language/script -- this is the common first pass
-    before any token-level normalization.
-    """
+    """Unicode NFKC normalization, ASCII transliteration, casefolding, and punctuation stripping."""
     if not text:
         return ""
-    text = unicodedata.normalize("NFKC", text)
+    text = unicodedata.normalize("NFKC", str(text))
     text = unidecode(text)
     text = text.casefold()
     text = _PUNCT_RE.sub(" ", text)
@@ -78,30 +92,59 @@ def basic_clean(text: Optional[str]) -> str:
     return text
 
 
-def normalize_name(name: Optional[str]) -> str:
-    """Normalize a business name: clean, then fold legal suffixes."""
-    cleaned = basic_clean(name)
+def clean_domain_name(name: Optional[str]) -> str:
+    """If the business name is structured as a URL/domain name, extract and clean the core token."""
+    if not name:
+        return ""
+    trimmed = name.strip()
+    match = _DOMAIN_RE.match(trimmed)
+    if match:
+        core = match.group(1)
+        core = re.sub(r"[\.\-_]", " ", core)
+        return basic_clean(core)
+    return basic_clean(name)
+
+
+def normalize_name(name: Optional[str], strip_suffixes: bool = False) -> str:
+    """Normalize business name: domain extraction, basic clean, legal suffix folding or removal."""
+    cleaned = clean_domain_name(name)
     if not cleaned:
         return ""
-    tokens = [LEGAL_SUFFIX_MAP.get(t, t) for t in cleaned.split(" ")]
-    return " ".join(tokens)
+    tokens = cleaned.split(" ")
+    if strip_suffixes:
+        tokens = [t for t in tokens if t not in LEGAL_SUFFIXES]
+    else:
+        tokens = [LEGAL_SUFFIX_MAP.get(t, t) for t in tokens]
+    return " ".join(tokens).strip()
 
 
 def normalize_address(address: Optional[str]) -> str:
-    """Normalize an address: clean, then fold street-type abbreviations.
-
-    TODO (feat/normalize): handle landmark-style fragments ("Near SBI ATM"),
-    municipal numbering variants, and component reordering (street/city/state
-    appearing in different orders across sources).
-    """
+    """Normalize address: clean, standard street abbreviations, and whitespace collapse."""
     cleaned = basic_clean(address)
     if not cleaned:
         return ""
     tokens = [STREET_ABBREV_MAP.get(t, t) for t in cleaned.split(" ")]
-    return " ".join(tokens)
+    return " ".join(tokens).strip()
 
 
-def name_tokens(name: Optional[str]) -> set:
-    """Token set of a normalized name, useful for Jaccard-style blocking keys."""
-    normalized = normalize_name(name)
-    return set(normalized.split(" ")) if normalized else set()
+def extract_numeric_tokens(text: Optional[str]) -> Set[str]:
+    """Extract all standalone numeric tokens (postal/PIN codes, building numbers, unit numbers)."""
+    if not text:
+        return set()
+    return set(_NUMERIC_RE.findall(str(text)))
+
+
+def name_tokens(name: Optional[str], min_len: int = 2) -> Set[str]:
+    """Token set of normalized name, excluding single characters and common legal words."""
+    norm = normalize_name(name, strip_suffixes=True)
+    if not norm:
+        return set()
+    return {t for t in norm.split(" ") if len(t) >= min_len and t not in LEGAL_SUFFIXES}
+
+
+def address_tokens(address: Optional[str], min_len: int = 2) -> Set[str]:
+    """Token set of normalized address, excluding very short noise tokens."""
+    norm = normalize_address(address)
+    if not norm:
+        return set()
+    return {t for t in norm.split(" ") if len(t) >= min_len}

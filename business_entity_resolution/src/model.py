@@ -1,66 +1,111 @@
 """Match / no-match classifier over candidate pairs.
 
-Owner: feat/model branch.
-
-Constraints from the challenge:
-- Final model must be MIT/Apache-2.0 licensed and <= 8B parameters. A
-  scikit-learn classifier over hand-engineered features (this stub) trivially
-  satisfies that; if the team wants an embedding/transformer component later,
-  double-check its license and parameter count before adopting it.
-- F_0.5 is precision-heavy and computed *per Source-1 entity* (not globally),
-  so:
-    - Tune the decision threshold on validation data using the macro F_0.5
-      scorer in evaluate.py, not plain accuracy/AUC.
-    - Consider constraining predictions per Source-1 entity (e.g. only keep
-      candidates above threshold AND within some margin of the top score)
-      rather than a single global cutoff, since a business with many
-      look-alikes needs a stricter bar than one with an obvious unique match.
-
-This module intentionally does not hardcode a training loop shape yet --
-fill in once features.py has a settled feature set and blocking.py has
-established candidate recall.
+Owner: feat/model.
+Uses LightGBM (MIT licensed, efficient, tabular powerhouse) with:
+1. Macro F0.5-optimized threshold selection.
+2. Per-entity relative margin pruning.
+3. Singleton preservation policy.
 """
 from dataclasses import dataclass
-from typing import List
-
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+import lightgbm as lgb
 import numpy as np
-from sklearn.ensemble import GradientBoostingClassifier
 
-from . import config
-
-FEATURE_ORDER: List[str] = [
-    "name_exact_match",
-    "name_token_jaccard",
-    "name_fuzzy_ratio",
-    "name_token_sort_ratio",
-    "name_partial_ratio",
-    "address_fuzzy_ratio",
-    "address_token_sort_ratio",
-    "country_match",
-    "name_len_diff",
-]
+from . import evaluate
+from .features import FEATURE_ORDER
 
 
 @dataclass
 class MatchModel:
-    threshold: float = 0.5
-    clf: GradientBoostingClassifier = None
+    threshold: float = 0.65
+    margin: float = 0.15
+    clf: Optional[lgb.LGBMClassifier] = None
 
     def __post_init__(self):
         if self.clf is None:
-            self.clf = GradientBoostingClassifier(random_state=config.RANDOM_SEED)
+            self.clf = lgb.LGBMClassifier(
+                n_estimators=150,
+                learning_rate=0.05,
+                num_leaves=31,
+                random_state=42,
+                class_weight="balanced",
+                n_jobs=-1,
+                verbose=-1,
+            )
 
     def to_matrix(self, feature_dicts: List[dict]) -> np.ndarray:
-        return np.array([[fd[k] for k in FEATURE_ORDER] for fd in feature_dicts], dtype=float)
+        return np.array([[fd.get(k, 0.0) for k in FEATURE_ORDER] for fd in feature_dicts], dtype=np.float32)
 
     def fit(self, feature_dicts: List[dict], labels: List[int]) -> "MatchModel":
         X = self.to_matrix(feature_dicts)
-        self.clf.fit(X, labels)
+        y = np.array(labels, dtype=int)
+        self.clf.fit(X, y)
         return self
 
     def predict_proba(self, feature_dicts: List[dict]) -> np.ndarray:
+        if not feature_dicts:
+            return np.array([], dtype=float)
         X = self.to_matrix(feature_dicts)
         return self.clf.predict_proba(X)[:, 1]
 
-    def predict(self, feature_dicts: List[dict]) -> np.ndarray:
-        return (self.predict_proba(feature_dicts) >= self.threshold).astype(int)
+    def predict_for_entities(
+        self,
+        entity_candidates_scores: Dict[str, List[Tuple[str, float]]],
+        threshold: Optional[float] = None,
+        margin: Optional[float] = None,
+    ) -> Dict[str, List[str]]:
+        """Apply precision-heavy relative margin decision policy per Source-1 entity.
+
+        Keeps candidate if:
+        1. prob >= threshold
+        2. prob >= (max_prob_for_entity - margin)
+        If no candidate exceeds threshold, entity is treated as a singleton (returns empty list).
+        """
+        th = self.threshold if threshold is None else threshold
+        mg = self.margin if margin is None else margin
+
+        predictions: Dict[str, List[str]] = {}
+
+        for s1_id, cand_scores in entity_candidates_scores.items():
+            if not cand_scores:
+                predictions[s1_id] = []
+                continue
+
+            max_score = max(score for _, score in cand_scores)
+            if max_score < th:
+                # Singleton protection: no candidate is confident enough
+                predictions[s1_id] = []
+                continue
+
+            selected = [
+                cand_id
+                for cand_id, score in cand_scores
+                if score >= th and score >= (max_score - mg)
+            ]
+            predictions[s1_id] = selected
+
+        return predictions
+
+    def tune_threshold(
+        self,
+        entity_candidates_scores: Dict[str, List[Tuple[str, float]]],
+        ground_truth: Dict[str, Set[str]],
+        threshold_candidates: Optional[Iterable[float]] = None,
+    ) -> Tuple[float, float]:
+        """Grid search decision threshold to maximize macro F_0.5 score."""
+        if threshold_candidates is None:
+            threshold_candidates = [round(x, 2) for x in np.arange(0.35, 0.90, 0.05)]
+
+        best_th = self.threshold
+        best_score = -1.0
+
+        for th in threshold_candidates:
+            preds = self.predict_for_entities(entity_candidates_scores, threshold=th, margin=self.margin)
+            score_dict = evaluate.macro_f0_5(preds, ground_truth)
+            f_score = float(score_dict["macro_f0_5"])
+            if f_score > best_score:
+                best_score = f_score
+                best_th = th
+
+        self.threshold = best_th
+        return best_th, best_score

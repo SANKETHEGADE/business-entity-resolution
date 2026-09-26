@@ -83,7 +83,7 @@ def build_pair_dataset(
     return pos_features, [0] * len(pos_features), pair_index
 
 
-def run_train(sample: bool = False) -> None:
+def run_train(sample: bool = False, rerank: bool = False) -> None:
     if sample or not config.TRAIN_FILES["S1"].exists():
         print("Using sample dataset for training & validation...")
         s1_file = config.DATA_DIR / "samples" / "sample_source1.tsv"
@@ -190,8 +190,38 @@ def run_train(sample: bool = False) -> None:
     score_report = evaluate.macro_f0_5(val_preds, val_gt)
     print(f"Singletons in Val: {score_report['n_singletons']} / {score_report['n_entities']}")
 
+    if rerank:
+        from . import accuracy_layer
+        train_probs_map = {}
+        train_base_probs = matcher.predict_proba(X_train_dicts)
+        p_idx = 0
+        for s1_id in train_s1[config.COL_ENTITY_ID]:
+            cand_list = train_candidates.get(s1_id, [])
+            for cand_id in cand_list:
+                train_probs_map[(s1_id, cand_id)] = float(train_base_probs[p_idx])
+                p_idx += 1
+        val_probs_map = {}
+        p_idx = 0
+        for s1_id in val_s1[config.COL_ENTITY_ID]:
+            cand_list = val_pair_index.get(s1_id, [])
+            for cand_id in cand_list:
+                val_probs_map[(s1_id, cand_id)] = float(val_probs[p_idx])
+                p_idx += 1
+        reranker, rerank_result = accuracy_layer.run_accuracy_reranker_train(
+            train_s1=train_s1,
+            val_s1=val_s1,
+            s2=s2,
+            s3=s3,
+            train_candidates=train_candidates,
+            val_candidates=val_candidates,
+            train_base_probs=train_probs_map,
+            val_base_probs=val_probs_map,
+            ground_truth=ground_truth,
+            val_gt=val_gt,
+        )
 
-def run_test(sample: bool = False) -> None:
+
+def run_test(sample: bool = False, rerank: bool = False) -> None:
     if sample or not config.TEST_FILES["S1"].exists():
         print("Using sample dataset as test set...")
         s1_file = config.DATA_DIR / "samples" / "sample_source1.tsv"
@@ -241,7 +271,7 @@ def run_test(sample: bool = False) -> None:
     tr_cands = {sid: tr_c2.get(sid, set()) | tr_c3.get(sid, set()) for sid in tr_s1[config.COL_ENTITY_ID]}
 
     other_train_records = {**extract_record_maps(tr_s2), **extract_record_maps(tr_s3)}
-    X_train, y_train, _ = build_pair_dataset(tr_s1, tr_cands, other_train_records, tr_gt, max_neg_ratio=6.0)
+    X_train, y_train, tr_pair_index = build_pair_dataset(tr_s1, tr_cands, other_train_records, tr_gt, max_neg_ratio=6.0)
 
     matcher = model.MatchModel()
     matcher.fit(X_train, y_train)
@@ -264,13 +294,42 @@ def run_test(sample: bool = False) -> None:
             idx += 1
         test_entity_scores[s1_id] = scored_pairs
 
-    # Apply precision-heavy thresholding with calibrated parameters
-    final_matches = matcher.predict_for_entities(
-        test_entity_scores,
-        threshold=0.65,
-        margin=0.10,
-        confidence_hurdle=0.65,
-    )
+    if rerank:
+        from . import accuracy_layer
+        train_probs = matcher.predict_proba(X_train)
+        train_probs_map = {}
+        tr_idx = 0
+        for sid in tr_s1[config.COL_ENTITY_ID]:
+            for cid in tr_pair_index.get(sid, []):
+                train_probs_map[(sid, cid)] = float(train_probs[tr_idx])
+                tr_idx += 1
+
+        test_probs_map = {}
+        p_idx = 0
+        for s1_id in s1[config.COL_ENTITY_ID]:
+            cand_list = test_pair_index.get(s1_id, [])
+            for cand_id in cand_list:
+                test_probs_map[(s1_id, cand_id)] = float(test_probs[p_idx])
+                p_idx += 1
+        final_matches = accuracy_layer.run_accuracy_reranker_test(
+            s1=s1,
+            s2=s2,
+            s3=s3,
+            candidates=candidates,
+            test_base_probs=test_probs_map,
+            train_s1=tr_s1,
+            train_candidates=tr_cands,
+            train_base_probs=train_probs_map,
+            ground_truth=tr_gt,
+        )
+    else:
+        # Apply precision-heavy thresholding with calibrated parameters
+        final_matches = matcher.predict_for_entities(
+            test_entity_scores,
+            threshold=0.65,
+            margin=0.10,
+            confidence_hurdle=0.65,
+        )
     io_utils.write_matching_results(final_matches)
     print(f"Wrote {config.MATCHING_RESULTS_PATH}")
     print("Test pipeline completed successfully!")
@@ -280,12 +339,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--split", choices=["train", "test"], required=True)
     parser.add_argument("--sample", action="store_true", help="Run on sample dataset.")
+    parser.add_argument("--rerank", action="store_true", help="Apply Accuracy / Reranking / Tuning Layer.")
     args = parser.parse_args()
 
     if args.split == "train":
-        run_train(sample=args.sample)
+        run_train(sample=args.sample, rerank=args.rerank)
     else:
-        run_test(sample=args.sample)
+        run_test(sample=args.sample, rerank=args.rerank)
 
 
 if __name__ == "__main__":

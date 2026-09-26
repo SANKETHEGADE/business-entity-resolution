@@ -138,7 +138,7 @@ def generate_candidates(
     X_other = vec.fit_transform(other_names)
 
     candidates: Dict[str, Set[str]] = {sid: set() for sid in s1_ids}
-    batch_size = 25000
+    batch_size = 1000  # Reduced: avoids OOM on large corpora in fallback path
 
     # 3. Vectorized sparse matrix multiplication in memory-friendly batches
     for start_idx in range(0, len(s1_names), batch_size):
@@ -168,31 +168,35 @@ def generate_candidates(
                     c_set.add(other_ids[c_col])
                 candidates[sid] = c_set
         else:
-            chunk_sim = X_chunk @ X_other.T
+            # Row-by-row fallback: avoids materialising the full chunk x corpus
+            # sparse matrix which causes OOM on large corpora (S2/S3 > 5M rows).
+            # Each row produces a 1 x N sparse result (~20 MB dense) — safe.
             for local_i in range(len(chunk_names)):
                 global_i = start_idx + local_i
                 sid = s1_ids[global_i]
                 s_c = s1_countries[global_i] if s1_countries is not None else ""
-                row = chunk_sim.getrow(local_i)
+
+                row_sparse = X_chunk[local_i] @ X_other.T  # 1 x N_other sparse
+                row_arr = np.asarray(row_sparse.todense()).ravel()  # ~20 MB
+
+                above = np.where(row_arr >= tau_block)[0]
+                if len(above) == 0:
+                    candidates[sid] = set()
+                    continue
+
+                if len(above) > top_k:
+                    top_sub = np.argpartition(-row_arr[above], top_k)[:top_k]
+                    k_idx = above[top_sub]
+                else:
+                    k_idx = above
+
                 c_set = set()
-                if row.nnz > 0:
-                    r_data = row.data
-                    r_indices = row.indices
-                    if len(r_data) > top_k:
-                        top_sub = np.argpartition(-r_data, top_k)[:top_k]
-                        k_idx = r_indices[top_sub]
-                        k_val = r_data[top_sub]
-                    else:
-                        k_idx = r_indices
-                        k_val = r_data
-                    for c_col, val in zip(k_idx, k_val):
-                        if val < tau_block:
+                for c_col in k_idx:
+                    if s_c and other_countries is not None:
+                        o_c = other_countries[c_col]
+                        if o_c and s_c != o_c:
                             continue
-                        if s_c and other_countries is not None:
-                            o_c = other_countries[c_col]
-                            if o_c and s_c != o_c:
-                                continue
-                        c_set.add(other_ids[c_col])
+                    c_set.add(other_ids[c_col])
                 candidates[sid] = c_set
 
     # 4. Address-anchor fallback for entities with 0 name-based candidates

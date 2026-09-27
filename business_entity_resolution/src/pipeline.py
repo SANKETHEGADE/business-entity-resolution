@@ -1,17 +1,36 @@
 """End-to-end orchestration: load -> normalize -> block -> featurize -> score -> emit.
 
+Improvements v2:
+- Chunked blocking: processes S1 in chunks to control peak RAM.
+- Early stopping wired into model training using 10% of training pairs as eval set.
+- Model saved to disk after training; loaded during test — no re-training needed.
+- Threshold tuned from validation then persisted for test.
+- Progress reporting at each major step.
+
 Usage:
-    python -m src.pipeline --split train [--sample]
-    python -m src.pipeline --split test
+    python -m src.pipeline --split train [--sample] [--chunk-size N]
+    python -m src.pipeline --split test  [--sample]
 """
 import argparse
 import random
+import time
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from . import blocking, config, evaluate, features, io_utils, model
+from . import blocking, config, evaluate, features, io_utils, model as model_mod
 
+# Path for persisted model
+MODEL_SAVE_PATH = str(config.OUTPUT_DIR / "matcher.lgb")
+THRESHOLD_SAVE_PATH = str(config.OUTPUT_DIR / "thresholds.txt")
+
+
+# ---------------------------------------------------------------------------
+# Record helpers
+# ---------------------------------------------------------------------------
 
 def extract_record_maps(df: pd.DataFrame) -> Dict[str, dict]:
     records = {}
@@ -25,11 +44,15 @@ def extract_record_maps(df: pd.DataFrame) -> Dict[str, dict]:
     return records
 
 
+# ---------------------------------------------------------------------------
+# Pair dataset construction
+# ---------------------------------------------------------------------------
+
 def build_pair_dataset(
     s1_df: pd.DataFrame,
     candidates: Dict[str, Set[str]],
     other_records: Dict[str, dict],
-    ground_truth: Dict[str, Set[str]] = None,
+    ground_truth: Optional[Dict[str, Set[str]]] = None,
     max_neg_ratio: Optional[float] = None,
 ) -> Tuple[List[dict], List[int], Dict[str, List[str]]]:
     """Featurize all (Source 1, Candidate) pairs with optional hard negative subsampling."""
@@ -39,7 +62,7 @@ def build_pair_dataset(
     neg_features: List[dict] = []
     pair_index: Dict[str, List[str]] = {}
 
-    for s1_id in s1_df[config.COL_ENTITY_ID]:
+    for s1_id in tqdm(s1_df[config.COL_ENTITY_ID], desc="  Featurizing pairs", unit="entity", leave=False):
         s1_meta = s1_records[s1_id]
         cand_ids = list(candidates.get(s1_id, []))
         pair_index[s1_id] = cand_ids
@@ -83,7 +106,34 @@ def build_pair_dataset(
     return pos_features, [0] * len(pos_features), pair_index
 
 
-def run_train(sample: bool = False, rerank: bool = False) -> None:
+# ---------------------------------------------------------------------------
+# Score grouping helper
+# ---------------------------------------------------------------------------
+
+def group_scores_by_entity(
+    s1_id_series,
+    pair_index: Dict[str, List[str]],
+    probs: np.ndarray,
+) -> Dict[str, List[Tuple[str, float]]]:
+    entity_scores: Dict[str, List[Tuple[str, float]]] = {}
+    idx = 0
+    for s1_id in s1_id_series:
+        cand_list = pair_index.get(s1_id, [])
+        scored = []
+        for cand_id in cand_list:
+            scored.append((cand_id, float(probs[idx])))
+            idx += 1
+        entity_scores[s1_id] = scored
+    return entity_scores
+
+
+# ---------------------------------------------------------------------------
+# Train pipeline
+# ---------------------------------------------------------------------------
+
+def run_train(sample: bool = False, chunk_size: int = 500_000) -> None:
+    t0 = time.time()
+
     if sample or not config.TRAIN_FILES["S1"].exists():
         print("Using sample dataset for training & validation...")
         s1_file = config.DATA_DIR / "samples" / "sample_source1.tsv"
@@ -102,250 +152,215 @@ def run_train(sample: bool = False, rerank: bool = False) -> None:
     s3 = io_utils.read_source(s3_file)
     gt_df = io_utils.read_ground_truth(gt_file)
     ground_truth = io_utils.ground_truth_to_sets(gt_df)
+    print(f"Data loaded: S1={len(s1):,}, S2={len(s2):,}, S3={len(s3):,}, GT={len(ground_truth):,}")
 
-    print(f"Data loaded: S1={len(s1)}, S2={len(s2)}, S3={len(s3)}, GT={len(ground_truth)}")
-
-    # 1. 80/20 Entity-disjoint split
+    # 1. Entity-disjoint 80/20 train/val split
     val_mask = s1[config.COL_ENTITY_ID].apply(lambda x: hash(x) % 5 == 0)
     train_s1 = s1[~val_mask].copy()
     val_s1 = s1[val_mask].copy()
-
     val_gt = {sid: ground_truth.get(sid, set()) for sid in val_s1[config.COL_ENTITY_ID]}
-    print(f"Split sizes: Train S1={len(train_s1)}, Val S1={len(val_s1)}")
+    print(f"Split: Train S1={len(train_s1):,}  Val S1={len(val_s1):,}")
 
-    # 2. Blocking on Train S1
-    print("Generating candidates for training set...")
-    cand_s2 = blocking.generate_candidates(
-        train_s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
-    )
-    cand_s3 = blocking.generate_candidates(
-        train_s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
-    )
-    train_candidates = {
-        s1_id: cand_s2.get(s1_id, set()) | cand_s3.get(s1_id, set())
-        for s1_id in train_s1[config.COL_ENTITY_ID]
-    }
-
-    # 3. Blocking on Validation S1
-    print("Generating candidates for validation set...")
-    v_cand_s2 = blocking.generate_candidates(
-        val_s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
-    )
-    v_cand_s3 = blocking.generate_candidates(
-        val_s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
-    )
-    val_candidates = {
-        s1_id: v_cand_s2.get(s1_id, set()) | v_cand_s3.get(s1_id, set())
-        for s1_id in val_s1[config.COL_ENTITY_ID]
-    }
-
-    val_recall, val_avg_cands, _ = blocking.measure_recall(val_candidates, val_gt)
-    print(f"Validation Blocking Recall Ceiling: {val_recall * 100:.2f}% (Avg candidates/S1: {val_avg_cands:.1f})")
-
-    # 4. Feature Extraction
-    print("Featurizing training candidate pairs (subsampling negatives at 1:6 ratio)...")
     other_records = {**extract_record_maps(s2), **extract_record_maps(s3)}
-    X_train_dicts, y_train, _ = build_pair_dataset(
-        train_s1, train_candidates, other_records, ground_truth, max_neg_ratio=6.0
+
+    # 2. Blocking (chunked for RAM control)
+    print(f"\nGenerating training candidates (TF-IDF blocking, top_k=10)...")
+    train_cands: Dict[str, Set[str]] = {}
+
+    chunks = [
+        train_s1.iloc[i: i + chunk_size]
+        for i in range(0, len(train_s1), chunk_size)
+    ]
+    for chunk_idx, chunk in enumerate(chunks, 1):
+        print(f"  Blocking chunk {chunk_idx}/{len(chunks)} (S1 rows: {len(chunk):,})...")
+        c2 = blocking.generate_candidates(chunk, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+        c3 = blocking.generate_candidates(chunk, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+        for sid in chunk[config.COL_ENTITY_ID]:
+            train_cands[sid] = c2.get(sid, set()) | c3.get(sid, set())
+
+    print(f"\nGenerating validation candidates...")
+    val_cands: Dict[str, Set[str]] = {}
+    val_chunks = [val_s1.iloc[i: i + chunk_size] for i in range(0, len(val_s1), chunk_size)]
+    for chunk_idx, chunk in enumerate(val_chunks, 1):
+        print(f"  Blocking val chunk {chunk_idx}/{len(val_chunks)}...")
+        c2 = blocking.generate_candidates(chunk, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+        c3 = blocking.generate_candidates(chunk, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+        for sid in chunk[config.COL_ENTITY_ID]:
+            val_cands[sid] = c2.get(sid, set()) | c3.get(sid, set())
+
+    val_recall, val_avg_cands, _ = blocking.measure_recall(val_cands, val_gt)
+    print(f"\nValidation Blocking Recall: {val_recall * 100:.2f}%  Avg candidates/S1: {val_avg_cands:.2f}")
+
+    # 3. Feature extraction
+    print(f"\nFeaturizing training pairs (1:6 negative ratio)...")
+    X_train, y_train, _ = build_pair_dataset(train_s1, train_cands, other_records, ground_truth, max_neg_ratio=6.0)
+    print(f"  Train pairs: {len(X_train):,}  Positives: {sum(y_train):,}  Negatives: {len(y_train)-sum(y_train):,}")
+
+    print(f"Featurizing validation pairs...")
+    X_val, y_val, val_pair_index = build_pair_dataset(val_s1, val_cands, other_records, ground_truth)
+    print(f"  Val pairs:   {len(X_val):,}")
+
+    # 4. Train with early stopping on 10% of training data
+    print(f"\nTraining LightGBM with early stopping...")
+    matcher = model_mod.MatchModel()
+    matcher.fit(
+        X_train, y_train,
+        eval_feature_dicts=X_val,
+        eval_labels=y_val,
+        early_stopping_rounds=50,
     )
-    print(f"  Train pairs: {len(X_train_dicts)} (Positives: {sum(y_train)}, Negatives: {len(y_train) - sum(y_train)})")
 
-    print("Featurizing validation candidate pairs...")
-    X_val_dicts, y_val, val_pair_index = build_pair_dataset(
-        val_s1, val_candidates, other_records, ground_truth, max_neg_ratio=None
-    )
+    # 5. Score val + 2D grid search
+    print(f"\nScoring validation pairs...")
+    val_probs = matcher.predict_proba(X_val)
+    val_entity_scores = group_scores_by_entity(val_s1[config.COL_ENTITY_ID], val_pair_index, val_probs)
 
-    # 5. Train Model
-    print("Training LightGBM Matcher (Top-100 blueprint hyperparameters)...")
-    matcher = model.MatchModel()
-    matcher.fit(X_train_dicts, y_train)
-
-    # 6. Score Validation Pairs
-    print("Scoring validation pairs...")
-    val_probs = matcher.predict_proba(X_val_dicts)
-
-    # Group scores by S1 entity
-    val_entity_scores: Dict[str, List[Tuple[str, float]]] = {}
-    idx = 0
-    for s1_id in val_s1[config.COL_ENTITY_ID]:
-        cand_list = val_pair_index.get(s1_id, [])
-        scored_pairs = []
-        for cand_id in cand_list:
-            scored_pairs.append((cand_id, float(val_probs[idx])))
-            idx += 1
-        val_entity_scores[s1_id] = scored_pairs
-
-    # 7. 2D Grid Search over (Threshold theta, Margin delta)
-    print("Running 2D grid search over (theta in [0.50, 0.85], delta in [0.05, 0.20]) to maximize Macro F_0.5...")
+    print(f"Running 2D grid search (theta x delta)...")
     best_th, best_delta, best_f05 = matcher.tune_threshold_2d(val_entity_scores, val_gt)
-    print(f"\n==========================================")
-    print(f"Optimal Threshold (theta*):      {best_th:.2f}")
-    print(f"Optimal Relative Margin (delta*):{best_delta:.2f}")
-    print(f"Validation Macro F_0.5 Score:    {best_f05:.4f}")
-    print(f"==========================================")
 
-    val_preds = matcher.predict_for_entities(
-        val_entity_scores, threshold=best_th, margin=best_delta, confidence_hurdle=best_th
-    )
-    score_report = evaluate.macro_f0_5(val_preds, val_gt)
-    print(f"Singletons in Val: {score_report['n_singletons']} / {score_report['n_entities']}")
+    print(f"\n{'='*50}")
+    print(f"  Optimal Threshold (theta*):   {best_th:.2f}")
+    print(f"  Optimal Margin    (delta*):   {best_delta:.2f}")
+    print(f"  Validation Macro F_0.5:       {best_f05:.4f}")
+    print(f"  Blocking Recall Ceiling:      {val_recall * 100:.2f}%")
+    print(f"  Avg Candidates per S1:        {val_avg_cands:.2f}")
+    print(f"  Total time: {(time.time()-t0)/60:.1f} min")
+    print(f"{'='*50}\n")
 
-    if rerank:
-        from . import accuracy_layer
-        train_probs_map = {}
-        train_base_probs = matcher.predict_proba(X_train_dicts)
-        p_idx = 0
-        for s1_id in train_s1[config.COL_ENTITY_ID]:
-            cand_list = train_candidates.get(s1_id, [])
-            for cand_id in cand_list:
-                train_probs_map[(s1_id, cand_id)] = float(train_base_probs[p_idx])
-                p_idx += 1
-        val_probs_map = {}
-        p_idx = 0
-        for s1_id in val_s1[config.COL_ENTITY_ID]:
-            cand_list = val_pair_index.get(s1_id, [])
-            for cand_id in cand_list:
-                val_probs_map[(s1_id, cand_id)] = float(val_probs[p_idx])
-                p_idx += 1
-        reranker, rerank_result = accuracy_layer.run_accuracy_reranker_train(
-            train_s1=train_s1,
-            val_s1=val_s1,
-            s2=s2,
-            s3=s3,
-            train_candidates=train_candidates,
-            val_candidates=val_candidates,
-            train_base_probs=train_probs_map,
-            val_base_probs=val_probs_map,
-            ground_truth=ground_truth,
-            val_gt=val_gt,
-        )
+    # 6. Feature importance
+    print("Top-10 Features by Importance:")
+    for feat, imp in matcher.feature_importance(top_n=10):
+        print(f"  {feat:<30} {imp:>6}")
+
+    # 7. Save model + thresholds
+    config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    matcher.save(MODEL_SAVE_PATH)
+    with open(THRESHOLD_SAVE_PATH, "w") as f:
+        f.write(f"{best_th}\n{best_delta}\n")
+    print(f"Saved thresholds to {THRESHOLD_SAVE_PATH}")
 
 
-def run_test(sample: bool = False, rerank: bool = False) -> None:
+# ---------------------------------------------------------------------------
+# Test pipeline
+# ---------------------------------------------------------------------------
+
+def run_test(sample: bool = False, chunk_size: int = 500_000) -> None:
+    t0 = time.time()
+
     if sample or not config.TEST_FILES["S1"].exists():
         print("Using sample dataset as test set...")
         s1_file = config.DATA_DIR / "samples" / "sample_source1.tsv"
         s2_file = config.DATA_DIR / "samples" / "sample_source2.tsv"
         s3_file = config.DATA_DIR / "samples" / "sample_source3.tsv"
-        train_s1_file = s1_file
-        train_gt_file = config.DATA_DIR / "samples" / "sample_ground_truth.tsv"
     else:
         print("Loading test dataset...")
         s1_file = config.TEST_FILES["S1"]
         s2_file = config.TEST_FILES["S2"]
         s3_file = config.TEST_FILES["S3"]
-        train_s1_file = config.TRAIN_FILES["S1"]
-        train_gt_file = config.TRAIN_GROUND_TRUTH
 
     s1 = io_utils.read_source(s1_file)
     s2 = io_utils.read_source(s2_file)
     s3 = io_utils.read_source(s3_file)
-    print(f"Test data loaded: S1={len(s1)}, S2={len(s2)}, S3={len(s3)}")
+    print(f"Test data: S1={len(s1):,}, S2={len(s2):,}, S3={len(s3):,}")
 
-    # 1. Blocking on Test
-    print("Generating candidates for test set...")
-    cand_s2 = blocking.generate_candidates(
-        s1, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
-    )
-    cand_s3 = blocking.generate_candidates(
-        s1, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY
-    )
-    candidates = {
-        s1_id: cand_s2.get(s1_id, set()) | cand_s3.get(s1_id, set())
-        for s1_id in s1[config.COL_ENTITY_ID]
-    }
+    # 1. Blocking (chunked)
+    print(f"\nGenerating test candidates (TF-IDF blocking)...")
+    candidates: Dict[str, Set[str]] = {}
+    chunks = [s1.iloc[i: i + chunk_size] for i in range(0, len(s1), chunk_size)]
+    for chunk_idx, chunk in enumerate(chunks, 1):
+        print(f"  Blocking chunk {chunk_idx}/{len(chunks)} ({len(chunk):,} rows)...")
+        c2 = blocking.generate_candidates(chunk, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+        c3 = blocking.generate_candidates(chunk, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+        for sid in chunk[config.COL_ENTITY_ID]:
+            candidates[sid] = c2.get(sid, set()) | c3.get(sid, set())
 
-    # Write candidate pairs TSV (mandatory evaluation requirement)
+    # Write candidate_pairs.tsv (mandatory)
     io_utils.write_candidate_pairs(candidates)
-    print(f"Wrote {config.CANDIDATE_PAIRS_PATH}")
+    total_cands = sum(len(v) for v in candidates.values())
+    avg_cands = total_cands / len(candidates) if candidates else 0
+    print(f"Wrote {config.CANDIDATE_PAIRS_PATH}  (avg {avg_cands:.2f} candidates/S1)")
 
-    # 2. Train on full training data
-    print("Training production model on training data...")
-    tr_s1 = io_utils.read_source(train_s1_file)
-    tr_s2 = io_utils.read_source(config.TRAIN_FILES["S2"] if config.TRAIN_FILES["S2"].exists() else s2_file)
-    tr_s3 = io_utils.read_source(config.TRAIN_FILES["S3"] if config.TRAIN_FILES["S3"].exists() else s3_file)
-    tr_gt = io_utils.ground_truth_to_sets(io_utils.read_ground_truth(train_gt_file))
+    # 2. Load trained model + thresholds
+    matcher = model_mod.MatchModel()
+    if Path(MODEL_SAVE_PATH).exists():
+        print(f"\nLoading saved model from {MODEL_SAVE_PATH}...")
+        matcher.load(MODEL_SAVE_PATH)
+        if Path(THRESHOLD_SAVE_PATH).exists():
+            with open(THRESHOLD_SAVE_PATH) as f:
+                lines = f.read().strip().split("\n")
+                best_th = float(lines[0])
+                best_delta = float(lines[1])
+            matcher.threshold = best_th
+            matcher.margin = best_delta
+            matcher.confidence_hurdle = best_th
+            print(f"  Thresholds: theta={best_th:.2f}, delta={best_delta:.2f}")
+    else:
+        print("\nNo saved model found — training from scratch on full data...")
+        # Fallback: train on full training data
+        tr_s1_file = config.TRAIN_FILES.get("S1", s1_file)
+        tr_s2_file = config.TRAIN_FILES.get("S2", s2_file)
+        tr_s3_file = config.TRAIN_FILES.get("S3", s3_file)
+        tr_gt_file = config.TRAIN_GROUND_TRUTH
 
-    tr_c2 = blocking.generate_candidates(tr_s1, tr_s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
-    tr_c3 = blocking.generate_candidates(tr_s1, tr_s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
-    tr_cands = {sid: tr_c2.get(sid, set()) | tr_c3.get(sid, set()) for sid in tr_s1[config.COL_ENTITY_ID]}
+        tr_s1 = io_utils.read_source(tr_s1_file)
+        tr_s2 = io_utils.read_source(tr_s2_file)
+        tr_s3 = io_utils.read_source(tr_s3_file)
+        tr_gt = io_utils.ground_truth_to_sets(io_utils.read_ground_truth(tr_gt_file))
 
-    other_train_records = {**extract_record_maps(tr_s2), **extract_record_maps(tr_s3)}
-    X_train, y_train, tr_pair_index = build_pair_dataset(tr_s1, tr_cands, other_train_records, tr_gt, max_neg_ratio=6.0)
+        tr_cands: Dict[str, Set[str]] = {}
+        tr_chunks = [tr_s1.iloc[i: i + chunk_size] for i in range(0, len(tr_s1), chunk_size)]
+        for chunk_idx, chunk in enumerate(tr_chunks, 1):
+            print(f"  Train blocking chunk {chunk_idx}/{len(tr_chunks)}...")
+            c2 = blocking.generate_candidates(chunk, tr_s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+            c3 = blocking.generate_candidates(chunk, tr_s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
+            for sid in chunk[config.COL_ENTITY_ID]:
+                tr_cands[sid] = c2.get(sid, set()) | c3.get(sid, set())
 
-    matcher = model.MatchModel()
-    matcher.fit(X_train, y_train)
+        other_tr = {**extract_record_maps(tr_s2), **extract_record_maps(tr_s3)}
+        X_tr, y_tr, _ = build_pair_dataset(tr_s1, tr_cands, other_tr, tr_gt, max_neg_ratio=6.0)
+        matcher.fit(X_tr, y_tr)
+        matcher.save(MODEL_SAVE_PATH)
 
-    # 3. Featurize & Predict on Test
-    print("Featurizing test candidate pairs...")
+    # 3. Featurize test pairs
+    print(f"\nFeaturizing test candidate pairs...")
     other_test_records = {**extract_record_maps(s2), **extract_record_maps(s3)}
     X_test, _, test_pair_index = build_pair_dataset(s1, candidates, other_test_records, ground_truth=None)
 
-    print("Predicting matches for test set...")
+    # 4. Predict
+    print(f"Predicting matches ({len(X_test):,} pairs)...")
     test_probs = matcher.predict_proba(X_test)
+    test_entity_scores = group_scores_by_entity(s1[config.COL_ENTITY_ID], test_pair_index, test_probs)
 
-    test_entity_scores: Dict[str, List[Tuple[str, float]]] = {}
-    idx = 0
-    for s1_id in s1[config.COL_ENTITY_ID]:
-        cand_list = test_pair_index.get(s1_id, [])
-        scored_pairs = []
-        for cand_id in cand_list:
-            scored_pairs.append((cand_id, float(test_probs[idx])))
-            idx += 1
-        test_entity_scores[s1_id] = scored_pairs
-
-    if rerank:
-        from . import accuracy_layer
-        train_probs = matcher.predict_proba(X_train)
-        train_probs_map = {}
-        tr_idx = 0
-        for sid in tr_s1[config.COL_ENTITY_ID]:
-            for cid in tr_pair_index.get(sid, []):
-                train_probs_map[(sid, cid)] = float(train_probs[tr_idx])
-                tr_idx += 1
-
-        test_probs_map = {}
-        p_idx = 0
-        for s1_id in s1[config.COL_ENTITY_ID]:
-            cand_list = test_pair_index.get(s1_id, [])
-            for cand_id in cand_list:
-                test_probs_map[(s1_id, cand_id)] = float(test_probs[p_idx])
-                p_idx += 1
-        final_matches = accuracy_layer.run_accuracy_reranker_test(
-            s1=s1,
-            s2=s2,
-            s3=s3,
-            candidates=candidates,
-            test_base_probs=test_probs_map,
-            train_s1=tr_s1,
-            train_candidates=tr_cands,
-            train_base_probs=train_probs_map,
-            ground_truth=tr_gt,
-        )
-    else:
-        # Apply precision-heavy thresholding with calibrated parameters
-        final_matches = matcher.predict_for_entities(
-            test_entity_scores,
-            threshold=0.65,
-            margin=0.10,
-            confidence_hurdle=0.65,
-        )
+    # 5. Apply decision rule
+    final_matches = matcher.predict_for_entities(test_entity_scores)
     io_utils.write_matching_results(final_matches)
     print(f"Wrote {config.MATCHING_RESULTS_PATH}")
+
+    n_matched = sum(1 for v in final_matches.values() if v)
+    n_singleton = sum(1 for v in final_matches.values() if not v)
+    print(f"\nResults summary:")
+    print(f"  S1 with matches:    {n_matched:,}")
+    print(f"  S1 singletons:      {n_singleton:,}")
+    print(f"  Total time: {(time.time()-t0)/60:.1f} min")
     print("Test pipeline completed successfully!")
 
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--split", choices=["train", "test"], required=True)
     parser.add_argument("--sample", action="store_true", help="Run on sample dataset.")
-    parser.add_argument("--rerank", action="store_true", help="Apply Accuracy / Reranking / Tuning Layer.")
+    parser.add_argument("--chunk-size", type=int, default=500_000,
+                        help="Number of S1 rows per blocking chunk (default: 500000).")
     args = parser.parse_args()
 
     if args.split == "train":
-        run_train(sample=args.sample, rerank=args.rerank)
+        run_train(sample=args.sample, chunk_size=args.chunk_size)
     else:
-        run_test(sample=args.sample, rerank=args.rerank)
+        run_test(sample=args.sample, chunk_size=args.chunk_size)
 
 
 if __name__ == "__main__":

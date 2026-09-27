@@ -184,47 +184,65 @@ def generate_candidates(
     other_countries = _country_series(other_df[actual_country] if actual_country in other_df.columns else pd.Series([""] * n_other))
 
     # ------------------------------------------------------------------
-    # 2. Name TF-IDF (char 2-4 gram + word) — fit on both corpora
+    # 2. Name TF-IDF — fit ONLY on index side (other_df), transform both
+    #    Use char 3-gram only + max_features cap to control RAM.
+    #    For very large corpora, fit on a random sample to save memory.
     # ------------------------------------------------------------------
-    print(f"  [Blocking] Fitting Name TF-IDF vectorizer...")
+    print(f"  [Blocking] Fitting Name TF-IDF vectorizer (max_features=150k)...")
+    FIT_SAMPLE = 300_000  # max rows used to fit vocabulary
+    fit_names = other_names
+    if len(fit_names) > FIT_SAMPLE:
+        rng = np.random.default_rng(42)
+        idx_sample = rng.choice(len(fit_names), size=FIT_SAMPLE, replace=False)
+        fit_names = [fit_names[i] for i in idx_sample]
+
     name_vectorizer = TfidfVectorizer(
         analyzer="char_wb",
-        ngram_range=(2, 4),
-        min_df=2,
-        max_df=0.95,
+        ngram_range=(3, 3),   # char 3-gram only — best recall/RAM tradeoff
+        min_df=3,
+        max_df=0.9,
+        max_features=150_000,  # hard cap on vocabulary size
         sublinear_tf=True,
         dtype=np.float32,
     )
-    all_names = s1_names + other_names
-    name_vectorizer.fit(all_names)
+    name_vectorizer.fit(fit_names)
+    del fit_names
+    gc.collect()
 
-    s1_name_mat = name_vectorizer.transform(s1_names)     # (n_s1, vocab)
+    s1_name_mat = name_vectorizer.transform(s1_names)       # (n_s1, vocab)
     other_name_mat = name_vectorizer.transform(other_names)  # (n_other, vocab)
-    del all_names
     gc.collect()
 
     # ------------------------------------------------------------------
-    # 3. Address TF-IDF (word n-gram)
+    # 3. Address TF-IDF (word unigram only — keeps RAM low)
     # ------------------------------------------------------------------
-    print(f"  [Blocking] Fitting Address TF-IDF vectorizer...")
-    addr_vectorizer = TfidfVectorizer(
-        analyzer="word",
-        ngram_range=(1, 2),
-        min_df=2,
-        max_df=0.9,
-        sublinear_tf=True,
-        dtype=np.float32,
-    )
-    all_addrs = s1_addrs + other_addrs
-    non_empty_count = sum(1 for a in all_addrs if a.strip())
-    use_addr_channel = non_empty_count > 100  # skip if nearly all empty
+    print(f"  [Blocking] Fitting Address TF-IDF vectorizer (max_features=50k)...")
+    non_empty_count = sum(1 for a in other_addrs if a.strip())
+    use_addr_channel = non_empty_count > 100
 
     if use_addr_channel:
-        addr_vectorizer.fit(all_addrs)
+        fit_addrs = other_addrs
+        if len(fit_addrs) > FIT_SAMPLE:
+            rng2 = np.random.default_rng(99)
+            idx2 = rng2.choice(len(fit_addrs), size=FIT_SAMPLE, replace=False)
+            fit_addrs = [fit_addrs[i] for i in idx2]
+
+        addr_vectorizer = TfidfVectorizer(
+            analyzer="word",
+            ngram_range=(1, 1),   # unigram only for address
+            min_df=3,
+            max_df=0.9,
+            max_features=50_000,
+            sublinear_tf=True,
+            dtype=np.float32,
+        )
+        addr_vectorizer.fit(fit_addrs)
+        del fit_addrs
+        gc.collect()
+
         s1_addr_mat = addr_vectorizer.transform(s1_addrs)
         other_addr_mat = addr_vectorizer.transform(other_addrs)
-    del all_addrs
-    gc.collect()
+        gc.collect()
 
     # ------------------------------------------------------------------
     # 4. Numeric/Postal exact-match index

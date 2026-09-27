@@ -59,46 +59,60 @@ def _batch_cosine_topk(
     query_matrix: sp.csr_matrix,
     index_matrix: sp.csr_matrix,
     top_k: int,
-    batch_size: int = 2048,
+    query_batch_size: int = 256,
+    index_shard_size: int = 100_000,
 ) -> List[List[Tuple[int, float]]]:
-    """Compute cosine similarity between query and index matrices in batches.
+    """Compute cosine similarity using double sharding to stay within Colab RAM limits.
 
-    Returns list of (index_row_idx, score) lists, one per query row,
-    containing up to top_k results with score > 0.
+    Peak RAM per multiply: query_batch_size x index_shard_size x 4 bytes.
+    Default: 256 x 100K x 4 = ~100 MB. Safe on 12 GB Colab.
+
+    Returns list of (index_row_idx, score) lists, one per query row.
     """
     n_queries = query_matrix.shape[0]
-    results: List[List[Tuple[int, float]]] = [[] for _ in range(n_queries)]
+    n_index = index_matrix.shape[0]
 
-    for start in range(0, n_queries, batch_size):
-        end = min(start + batch_size, n_queries)
-        batch = query_matrix[start:end]  # shape: (batch, features)
+    # Running top-k buffers: dict[query_idx] -> list of (score, index_idx)
+    top_scores: List[List[Tuple[float, int]]] = [[] for _ in range(n_queries)]
 
-        # (batch, n_index)  — sparse dot product
-        sims = batch.dot(index_matrix.T)
+    for q_start in range(0, n_queries, query_batch_size):
+        q_end = min(q_start + query_batch_size, n_queries)
+        q_batch = query_matrix[q_start:q_end]  # (q_batch, vocab)
 
-        if sp.issparse(sims):
-            sims = sims.toarray()
+        for i_start in range(0, n_index, index_shard_size):
+            i_end = min(i_start + index_shard_size, n_index)
+            i_shard = index_matrix[i_start:i_end]  # (shard, vocab)
 
-        # For each query in batch, pick top_k
-        for local_i, row_scores in enumerate(sims):
-            global_i = start + local_i
-            # argpartition is O(n) — much faster than full argsort on large arrays
-            if len(row_scores) <= top_k:
-                idxs = np.where(row_scores > 0.0)[0]
+            # Dense result: (q_batch, shard) — small enough to fit in RAM
+            sims = q_batch.dot(i_shard.T)
+            if sp.issparse(sims):
+                sims = sims.toarray()
             else:
-                # Get top_k candidates efficiently
-                part = np.argpartition(row_scores, -top_k)[-top_k:]
-                idxs = part[row_scores[part] > 0.0]
+                sims = np.asarray(sims)
 
-            if len(idxs) == 0:
-                continue
+            for local_qi in range(q_end - q_start):
+                global_qi = q_start + local_qi
+                row = sims[local_qi]
+                # Only bother with positive scores
+                pos_mask = row > 0.01
+                if not pos_mask.any():
+                    continue
+                pos_idxs = np.where(pos_mask)[0]
+                for j in pos_idxs:
+                    top_scores[global_qi].append((float(row[j]), int(i_start + j)))
 
-            top_pairs = sorted(
-                [(int(j), float(row_scores[j])) for j in idxs],
-                key=lambda x: x[1],
-                reverse=True,
-            )
-            results[global_i] = top_pairs[:top_k]
+            del sims
+
+        gc.collect()
+
+    # Extract final top-k for each query
+    results: List[List[Tuple[int, float]]] = []
+    for buf in top_scores:
+        if not buf:
+            results.append([])
+            continue
+        buf.sort(reverse=True)
+        results.append([(idx, score) for score, idx in buf[:top_k]])
 
     return results
 
@@ -138,7 +152,6 @@ def generate_candidates(
     addr_weight: float = 1.5,
     numeric_bonus: float = 2.0,
     min_score: float = 0.15,
-    batch_size: int = 2048,
 ) -> Dict[str, Set[str]]:
     """Generate high-probability candidate set using TF-IDF sparse matrix multiplication.
 
@@ -255,16 +268,16 @@ def generate_candidates(
     # ------------------------------------------------------------------
     # 5. Batch cosine similarity: Name channel
     # ------------------------------------------------------------------
-    print(f"  [Blocking] Computing Name cosine similarities (batch_size={batch_size})...")
-    name_topk = _batch_cosine_topk(s1_name_mat, other_name_mat, top_k * 3, batch_size)
+    print(f"  [Blocking] Computing Name cosine similarities (sharded: q=256, i=100k)...")
+    name_topk = _batch_cosine_topk(s1_name_mat, other_name_mat, top_k * 3)
 
     # ------------------------------------------------------------------
     # 6. Batch cosine similarity: Address channel
     # ------------------------------------------------------------------
     addr_topk: List[List[Tuple[int, float]]] = [[] for _ in range(n_s1)]
     if use_addr_channel:
-        print(f"  [Blocking] Computing Address cosine similarities (batch_size={batch_size})...")
-        addr_topk = _batch_cosine_topk(s1_addr_mat, other_addr_mat, top_k * 2, batch_size)
+        print(f"  [Blocking] Computing Address cosine similarities (sharded)...")
+        addr_topk = _batch_cosine_topk(s1_addr_mat, other_addr_mat, top_k * 2)
 
     # ------------------------------------------------------------------
     # 7. Fuse scores + numeric bonus + country filter -> top-K

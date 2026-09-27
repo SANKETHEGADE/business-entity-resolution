@@ -131,7 +131,7 @@ def group_scores_by_entity(
 # Train pipeline
 # ---------------------------------------------------------------------------
 
-def run_train(sample: bool = False, chunk_size: int = 500_000) -> None:
+def run_train(sample: bool = False, sample_other: int = 300_000) -> None:
     t0 = time.time()
 
     if sample or not config.TRAIN_FILES["S1"].exists():
@@ -140,6 +140,7 @@ def run_train(sample: bool = False, chunk_size: int = 500_000) -> None:
         s2_file = config.DATA_DIR / "samples" / "sample_source2.tsv"
         s3_file = config.DATA_DIR / "samples" / "sample_source3.tsv"
         gt_file = config.DATA_DIR / "samples" / "sample_ground_truth.tsv"
+        sample_other = None  # use all sample data
     else:
         print("Loading training dataset...")
         s1_file = config.TRAIN_FILES["S1"]
@@ -163,41 +164,46 @@ def run_train(sample: bool = False, chunk_size: int = 500_000) -> None:
 
     other_records = {**extract_record_maps(s2), **extract_record_maps(s3)}
 
-    # 2. Blocking (chunked for RAM control)
-    print(f"\nGenerating training candidates (TF-IDF blocking, top_k=10)...")
-    train_cands: Dict[str, Set[str]] = {}
+    # 2. Blocking — S2 and S3 each sampled to sample_other rows during training
+    print(f"\nGenerating training candidates (sample_other={sample_other})...")
+    cand_s2 = blocking.generate_candidates(
+        train_s1, s2, config.COL_ENTITY_ID, config.COL_NAME,
+        config.COL_ADDRESS, config.COL_COUNTRY, sample_other=sample_other
+    )
+    cand_s3 = blocking.generate_candidates(
+        train_s1, s3, config.COL_ENTITY_ID, config.COL_NAME,
+        config.COL_ADDRESS, config.COL_COUNTRY, sample_other=sample_other
+    )
+    train_candidates = {
+        s1_id: cand_s2.get(s1_id, set()) | cand_s3.get(s1_id, set())
+        for s1_id in train_s1[config.COL_ENTITY_ID]
+    }
 
-    chunks = [
-        train_s1.iloc[i: i + chunk_size]
-        for i in range(0, len(train_s1), chunk_size)
-    ]
-    for chunk_idx, chunk in enumerate(chunks, 1):
-        print(f"  Blocking chunk {chunk_idx}/{len(chunks)} (S1 rows: {len(chunk):,})...")
-        c2 = blocking.generate_candidates(chunk, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
-        c3 = blocking.generate_candidates(chunk, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
-        for sid in chunk[config.COL_ENTITY_ID]:
-            train_cands[sid] = c2.get(sid, set()) | c3.get(sid, set())
+    print(f"\nGenerating validation candidates (sample_other={sample_other})...")
+    v_cand_s2 = blocking.generate_candidates(
+        val_s1, s2, config.COL_ENTITY_ID, config.COL_NAME,
+        config.COL_ADDRESS, config.COL_COUNTRY, sample_other=sample_other
+    )
+    v_cand_s3 = blocking.generate_candidates(
+        val_s1, s3, config.COL_ENTITY_ID, config.COL_NAME,
+        config.COL_ADDRESS, config.COL_COUNTRY, sample_other=sample_other
+    )
+    val_candidates = {
+        s1_id: v_cand_s2.get(s1_id, set()) | v_cand_s3.get(s1_id, set())
+        for s1_id in val_s1[config.COL_ENTITY_ID]
+    }
 
-    print(f"\nGenerating validation candidates...")
-    val_cands: Dict[str, Set[str]] = {}
-    val_chunks = [val_s1.iloc[i: i + chunk_size] for i in range(0, len(val_s1), chunk_size)]
-    for chunk_idx, chunk in enumerate(val_chunks, 1):
-        print(f"  Blocking val chunk {chunk_idx}/{len(val_chunks)}...")
-        c2 = blocking.generate_candidates(chunk, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
-        c3 = blocking.generate_candidates(chunk, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
-        for sid in chunk[config.COL_ENTITY_ID]:
-            val_cands[sid] = c2.get(sid, set()) | c3.get(sid, set())
-
-    val_recall, val_avg_cands, _ = blocking.measure_recall(val_cands, val_gt)
+    val_recall, val_avg_cands, _ = blocking.measure_recall(val_candidates, val_gt)
     print(f"\nValidation Blocking Recall: {val_recall * 100:.2f}%  Avg candidates/S1: {val_avg_cands:.2f}")
 
     # 3. Feature extraction
     print(f"\nFeaturizing training pairs (1:6 negative ratio)...")
-    X_train, y_train, _ = build_pair_dataset(train_s1, train_cands, other_records, ground_truth, max_neg_ratio=6.0)
+    other_records = {**extract_record_maps(s2), **extract_record_maps(s3)}
+    X_train, y_train, _ = build_pair_dataset(train_s1, train_candidates, other_records, ground_truth, max_neg_ratio=6.0)
     print(f"  Train pairs: {len(X_train):,}  Positives: {sum(y_train):,}  Negatives: {len(y_train)-sum(y_train):,}")
 
     print(f"Featurizing validation pairs...")
-    X_val, y_val, val_pair_index = build_pair_dataset(val_s1, val_cands, other_records, ground_truth)
+    X_val, y_val, val_pair_index = build_pair_dataset(val_s1, val_candidates, other_records, ground_truth)
     print(f"  Val pairs:   {len(X_val):,}")
 
     # 4. Train with early stopping on 10% of training data
@@ -244,7 +250,7 @@ def run_train(sample: bool = False, chunk_size: int = 500_000) -> None:
 # Test pipeline
 # ---------------------------------------------------------------------------
 
-def run_test(sample: bool = False, chunk_size: int = 500_000) -> None:
+def run_test(sample: bool = False) -> None:
     t0 = time.time()
 
     if sample or not config.TEST_FILES["S1"].exists():
@@ -263,16 +269,20 @@ def run_test(sample: bool = False, chunk_size: int = 500_000) -> None:
     s3 = io_utils.read_source(s3_file)
     print(f"Test data: S1={len(s1):,}, S2={len(s2):,}, S3={len(s3):,}")
 
-    # 1. Blocking (chunked)
-    print(f"\nGenerating test candidates (TF-IDF blocking)...")
-    candidates: Dict[str, Set[str]] = {}
-    chunks = [s1.iloc[i: i + chunk_size] for i in range(0, len(s1), chunk_size)]
-    for chunk_idx, chunk in enumerate(chunks, 1):
-        print(f"  Blocking chunk {chunk_idx}/{len(chunks)} ({len(chunk):,} rows)...")
-        c2 = blocking.generate_candidates(chunk, s2, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
-        c3 = blocking.generate_candidates(chunk, s3, config.COL_ENTITY_ID, config.COL_NAME, config.COL_ADDRESS, config.COL_COUNTRY)
-        for sid in chunk[config.COL_ENTITY_ID]:
-            candidates[sid] = c2.get(sid, set()) | c3.get(sid, set())
+    # 1. Blocking (full data, no sampling for test)
+    print(f"\nGenerating test candidates (full S2/S3, no sampling)...")
+    cand_s2 = blocking.generate_candidates(
+        s1, s2, config.COL_ENTITY_ID, config.COL_NAME,
+        config.COL_ADDRESS, config.COL_COUNTRY, sample_other=None
+    )
+    cand_s3 = blocking.generate_candidates(
+        s1, s3, config.COL_ENTITY_ID, config.COL_NAME,
+        config.COL_ADDRESS, config.COL_COUNTRY, sample_other=None
+    )
+    candidates = {
+        s1_id: cand_s2.get(s1_id, set()) | cand_s3.get(s1_id, set())
+        for s1_id in s1[config.COL_ENTITY_ID]
+    }
 
     # Write candidate_pairs.tsv (mandatory)
     io_utils.write_candidate_pairs(candidates)
@@ -353,14 +363,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--split", choices=["train", "test"], required=True)
     parser.add_argument("--sample", action="store_true", help="Run on sample dataset.")
-    parser.add_argument("--chunk-size", type=int, default=500_000,
-                        help="Number of S1 rows per blocking chunk (default: 500000).")
+    parser.add_argument("--sample-other", type=int, default=300_000,
+                        help="Max S2/S3 rows to use during training blocking (default: 300000). Use 0 for full data.")
     args = parser.parse_args()
 
+    sample_other = None if args.sample_other == 0 else args.sample_other
+
     if args.split == "train":
-        run_train(sample=args.sample, chunk_size=args.chunk_size)
+        run_train(sample=args.sample, sample_other=sample_other)
     else:
-        run_test(sample=args.sample, chunk_size=args.chunk_size)
+        run_test(sample=args.sample)
 
 
 if __name__ == "__main__":

@@ -1,23 +1,19 @@
-"""High-Recall, High-Selectivity Blocking Engine — Scaled for Millions of Records.
+"""High-Recall Blocking Engine — RAM-Safe for 10M+ records on 12 GB Colab.
 
-Owner: feat/blocking.
-Design objectives:
-1. High Recall (>96% upper bound on matching pairs).
-2. Minimal Candidate Set Size: Keep candidates strictly bounded (Top-K per S1)
-   to maximize the candidate-size reduction ratio rewarded by Amazon evaluators.
-3. Scalable to 10M+ records using TF-IDF sparse matrix multiplication instead
-   of Python-loop inverted indices.
+Key design: NEVER materialise the full S2/S3 TF-IDF matrix in memory.
+Instead, transform index rows in shards of 100K at a time so peak RAM
+per matrix multiply is only ~300 MB regardless of S2/S3 size.
 
-Architecture (v2 — Production Scale):
-    Channel A: TF-IDF cosine similarity on normalized business names (char n-gram + word).
-    Channel B: Numeric/Postal anchor exact co-occurrence (lightweight dict lookup).
-    Channel C: Address token TF-IDF cosine similarity.
-    Merge    : Score fusion -> adaptive top-K per S1 entity.
-
-Performance target: < 10 min for 2M S1 x 10M S2+S3 on Colab T4 (CPU).
+Architecture:
+    Step 1 : Fit TF-IDF vocab on a random sample of the index side (300K rows).
+    Step 2 : Transform all S1 rows into a sparse matrix (small - max 200K rows).
+    Step 3 : Loop over index shards of 100K rows; transform each shard on-the-fly;
+             compute (S1_batch × shard.T) dense block of max 256 × 100K × 4B ≈ 100 MB.
+    Step 4 : Accumulate running top-K candidates per S1 entity.
+    Step 5 : Numeric/postal exact-match bonus.
+    Step 6 : Country filter + dynamic floor → emit candidate set.
 """
 import gc
-import math
 from collections import defaultdict
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -30,114 +26,112 @@ from . import normalize
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Text normalisation helpers
 # ---------------------------------------------------------------------------
 
-def _normalize_series(series: pd.Series) -> List[str]:
-    """Vectorized name normalization over a pandas Series."""
-    return [
-        normalize.normalize_name(v, strip_suffixes=True) if v else ""
-        for v in series.fillna("")
-    ]
+def _norm_names(series: pd.Series) -> List[str]:
+    return [normalize.normalize_name(v, strip_suffixes=True) if v else ""
+            for v in series.fillna("")]
 
 
-def _normalize_addr_series(series: pd.Series) -> List[str]:
-    return [
-        normalize.normalize_address(v) if v else ""
-        for v in series.fillna("")
-    ]
+def _norm_addrs(series: pd.Series) -> List[str]:
+    return [normalize.normalize_address(v) if v else ""
+            for v in series.fillna("")]
 
 
-def _country_series(series: pd.Series) -> List[str]:
-    return [
-        normalize.normalize_country(v) if v else ""
-        for v in series.fillna("")
-    ]
+def _norm_countries(series: pd.Series) -> List[str]:
+    return [normalize.normalize_country(v) if v else ""
+            for v in series.fillna("")]
 
 
-def _batch_cosine_topk(
-    query_matrix: sp.csr_matrix,
-    index_matrix: sp.csr_matrix,
+# ---------------------------------------------------------------------------
+# Core: sharded top-K cosine similarity
+# ---------------------------------------------------------------------------
+
+def _sharded_topk(
+    query_mat: sp.csr_matrix,           # (n_s1, vocab) — fits in RAM
+    index_texts: List[str],             # raw strings — transformed shard by shard
+    vectorizer: TfidfVectorizer,
     top_k: int,
-    query_batch_size: int = 256,
-    index_shard_size: int = 100_000,
+    query_batch: int = 512,
+    index_shard: int = 100_000,
 ) -> List[List[Tuple[int, float]]]:
-    """Compute cosine similarity using double sharding to stay within Colab RAM limits.
+    """Compute cosine top-K without ever building the full index matrix.
 
-    Peak RAM per multiply: query_batch_size x index_shard_size x 4 bytes.
-    Default: 256 x 100K x 4 = ~100 MB. Safe on 12 GB Colab.
-
-    Returns list of (index_row_idx, score) lists, one per query row.
+    Peak RAM per multiply:  query_batch × index_shard × 4 bytes
+                         =  512 × 100K × 4 = ~200 MB  — safe on Colab.
     """
-    n_queries = query_matrix.shape[0]
-    n_index = index_matrix.shape[0]
+    n_q = query_mat.shape[0]
+    n_i = len(index_texts)
 
-    # Running top-k buffers: dict[query_idx] -> list of (score, index_idx)
-    top_scores: List[List[Tuple[float, int]]] = [[] for _ in range(n_queries)]
+    # Running accumulators: top_scores[qi] = [(score, global_index_idx), ...]
+    top_buf: List[List[Tuple[float, int]]] = [[] for _ in range(n_q)]
 
-    for q_start in range(0, n_queries, query_batch_size):
-        q_end = min(q_start + query_batch_size, n_queries)
-        q_batch = query_matrix[q_start:q_end]  # (q_batch, vocab)
+    for i_start in range(0, n_i, index_shard):
+        i_end = min(i_start + index_shard, n_i)
+        shard_texts = index_texts[i_start:i_end]
 
-        for i_start in range(0, n_index, index_shard_size):
-            i_end = min(i_start + index_shard_size, n_index)
-            i_shard = index_matrix[i_start:i_end]  # (shard, vocab)
+        # Transform only this shard  →  (shard_size, vocab) sparse
+        shard_mat = vectorizer.transform(shard_texts)
 
-            # Dense result: (q_batch, shard) — small enough to fit in RAM
-            sims = q_batch.dot(i_shard.T)
+        for q_start in range(0, n_q, query_batch):
+            q_end = min(q_start + query_batch, n_q)
+            q = query_mat[q_start:q_end]          # (qb, vocab) sparse
+
+            # Dense result: (qb, shard_size)  — small enough
+            sims = q.dot(shard_mat.T)
             if sp.issparse(sims):
                 sims = sims.toarray()
-            else:
-                sims = np.asarray(sims)
+            sims = np.asarray(sims, dtype=np.float32)
 
-            for local_qi in range(q_end - q_start):
-                global_qi = q_start + local_qi
-                row = sims[local_qi]
-                # Only bother with positive scores
-                pos_mask = row > 0.01
-                if not pos_mask.any():
+            for local_qi, row in enumerate(sims):
+                pos = np.where(row > 0.02)[0]
+                if pos.size == 0:
                     continue
-                pos_idxs = np.where(pos_mask)[0]
-                for j in pos_idxs:
-                    top_scores[global_qi].append((float(row[j]), int(i_start + j)))
+                global_qi = q_start + local_qi
+                buf = top_buf[global_qi]
+                for j in pos:
+                    buf.append((float(row[j]), int(i_start + j)))
 
             del sims
 
+        del shard_mat
         gc.collect()
 
-    # Extract final top-k for each query
+    # Trim each buffer to top-K
     results: List[List[Tuple[int, float]]] = []
-    for buf in top_scores:
+    for buf in top_buf:
         if not buf:
             results.append([])
             continue
         buf.sort(reverse=True)
-        results.append([(idx, score) for score, idx in buf[:top_k]])
+        results.append([(idx, sc) for sc, idx in buf[:top_k]])
 
     return results
 
 
+# ---------------------------------------------------------------------------
+# Numeric / postal inverted index
+# ---------------------------------------------------------------------------
+
 def _build_numeric_index(
-    df: pd.DataFrame,
-    id_col: str,
-    addr_col: str,
+    df: pd.DataFrame, id_col: str, addr_col: str
 ) -> Dict[str, List[str]]:
-    """Build exact-match inverted index on numeric/postal tokens."""
-    index: Dict[str, List[str]] = defaultdict(list)
+    idx: Dict[str, List[str]] = defaultdict(list)
     for row in df.itertuples(index=False):
-        ent_id = getattr(row, id_col)
+        eid = getattr(row, id_col)
         addr = getattr(row, addr_col, "") or ""
-        for num in normalize.extract_numeric_tokens(addr):
-            if len(num) >= 4:  # skip trivial short numbers
-                index[num].append(ent_id)
-        for postal in normalize.extract_postal_tokens(addr):
-            if isinstance(postal, str) and len(postal) >= 4:
-                index[postal].append(ent_id)
-    return dict(index)
+        for tok in normalize.extract_numeric_tokens(addr):
+            if len(tok) >= 4:
+                idx[tok].append(eid)
+        for tok in normalize.extract_postal_tokens(addr):
+            if isinstance(tok, str) and len(tok) >= 4:
+                idx[tok].append(eid)
+    return dict(idx)
 
 
 # ---------------------------------------------------------------------------
-# Main public API
+# Public API
 # ---------------------------------------------------------------------------
 
 def generate_candidates(
@@ -153,28 +147,11 @@ def generate_candidates(
     numeric_bonus: float = 2.0,
     min_score: float = 0.15,
 ) -> Dict[str, Set[str]]:
-    """Generate high-probability candidate set using TF-IDF sparse matrix multiplication.
+    """Generate candidate set using RAM-safe sharded TF-IDF similarity.
 
-    Scales to millions of records. Typical runtime: 5-15 min for 2M x 10M on Colab CPU.
-
-    Args:
-        source1_df:    Source 1 dataframe (query side).
-        other_df:      Source 2 or 3 dataframe (index side).
-        id_col:        Entity ID column name.
-        name_col:      Business name column name.
-        addr_col:      Address column name.
-        country_col:   Country column name.
-        top_k:         Maximum candidates per S1 entity.
-        name_weight:   Score weight for name TF-IDF channel.
-        addr_weight:   Score weight for address TF-IDF channel.
-        numeric_bonus: Score bonus for shared numeric/postal tokens.
-        min_score:     Minimum fused score to keep a candidate.
-        batch_size:    Rows per batch for matrix multiplication.
-
-    Returns:
-        Dict mapping each S1 entity ID to a set of candidate entity IDs.
+    Never loads full S2/S3 TF-IDF matrix; transforms in 100K-row shards.
+    Peak RAM: ~1–2 GB regardless of S2/S3 size.
     """
-    # Resolve column names
     actual_addr = addr_col if addr_col in other_df.columns else "business_address"
     actual_country = country_col if country_col in other_df.columns else "country"
 
@@ -183,164 +160,144 @@ def generate_candidates(
     n_other = len(other_ids)
     n_s1 = len(s1_ids)
 
-    print(f"  [Blocking] S1={n_s1:,}, Other={n_other:,} — building TF-IDF indices...")
+    print(f"  [Blocking] S1={n_s1:,}, Other={n_other:,}")
 
     # ------------------------------------------------------------------
-    # 1. Normalize text
+    # 1. Normalise text (returns plain Python lists, not matrices)
     # ------------------------------------------------------------------
-    s1_names = _normalize_series(source1_df[name_col])
-    s1_addrs = _normalize_addr_series(source1_df[actual_addr] if actual_addr in source1_df.columns else pd.Series([""] * n_s1))
-    s1_countries = _country_series(source1_df[actual_country] if actual_country in source1_df.columns else pd.Series([""] * n_s1))
+    s1_names = _norm_names(source1_df[name_col])
+    s1_addrs_raw = list(source1_df[actual_addr].fillna("")) if actual_addr in source1_df.columns else [""] * n_s1
+    s1_addrs = _norm_addrs(pd.Series(s1_addrs_raw))
+    s1_countries = _norm_countries(source1_df[actual_country].fillna("") if actual_country in source1_df.columns else pd.Series([""] * n_s1))
 
-    other_names = _normalize_series(other_df[name_col])
-    other_addrs = _normalize_addr_series(other_df[actual_addr])
-    other_countries = _country_series(other_df[actual_country] if actual_country in other_df.columns else pd.Series([""] * n_other))
+    other_names: List[str] = _norm_names(other_df[name_col])
+    other_addrs_raw = list(other_df[actual_addr].fillna(""))
+    other_addrs: List[str] = _norm_addrs(pd.Series(other_addrs_raw))
+    other_countries: List[str] = _norm_countries(other_df[actual_country].fillna("") if actual_country in other_df.columns else pd.Series([""] * n_other))
 
     # ------------------------------------------------------------------
-    # 2. Name TF-IDF — fit ONLY on index side (other_df), transform both
-    #    Use char 3-gram only + max_features cap to control RAM.
-    #    For very large corpora, fit on a random sample to save memory.
+    # 2. Fit Name TF-IDF on a sample of the index side only
     # ------------------------------------------------------------------
-    print(f"  [Blocking] Fitting Name TF-IDF vectorizer (max_features=150k)...")
-    FIT_SAMPLE = 300_000  # max rows used to fit vocabulary
-    fit_names = other_names
-    if len(fit_names) > FIT_SAMPLE:
-        rng = np.random.default_rng(42)
-        idx_sample = rng.choice(len(fit_names), size=FIT_SAMPLE, replace=False)
-        fit_names = [fit_names[i] for i in idx_sample]
+    FIT_SAMPLE = 300_000
+    print(f"  [Blocking] Fitting Name TF-IDF on {min(n_other, FIT_SAMPLE):,} samples...")
+    rng = np.random.default_rng(42)
+    sample_idx = rng.choice(n_other, size=min(n_other, FIT_SAMPLE), replace=False)
+    fit_names = [other_names[i] for i in sample_idx]
 
-    name_vectorizer = TfidfVectorizer(
-        analyzer="char_wb",
-        ngram_range=(3, 3),   # char 3-gram only — best recall/RAM tradeoff
-        min_df=3,
-        max_df=0.9,
-        max_features=150_000,  # hard cap on vocabulary size
-        sublinear_tf=True,
-        dtype=np.float32,
+    name_vec = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3, 3),
+        min_df=2, max_df=0.9, max_features=150_000,
+        sublinear_tf=True, dtype=np.float32,
     )
-    name_vectorizer.fit(fit_names)
-    del fit_names
+    name_vec.fit(fit_names)
+    del fit_names, sample_idx
     gc.collect()
 
-    s1_name_mat = name_vectorizer.transform(s1_names)       # (n_s1, vocab)
-    other_name_mat = name_vectorizer.transform(other_names)  # (n_other, vocab)
+    # Transform ONLY S1 into a matrix — small enough (max 200K rows)
+    print(f"  [Blocking] Transforming S1 names ({n_s1:,} rows)...")
+    s1_name_mat = name_vec.transform(s1_names)   # (n_s1, vocab) ≈ 100–200 MB
     gc.collect()
 
     # ------------------------------------------------------------------
-    # 3. Address TF-IDF (word unigram only — keeps RAM low)
+    # 3. Fit Address TF-IDF on sample
     # ------------------------------------------------------------------
-    print(f"  [Blocking] Fitting Address TF-IDF vectorizer (max_features=50k)...")
-    non_empty_count = sum(1 for a in other_addrs if a.strip())
-    use_addr_channel = non_empty_count > 100
+    non_empty_addr = sum(1 for a in other_addrs if a.strip())
+    use_addr = non_empty_addr > 100
 
-    if use_addr_channel:
-        fit_addrs = other_addrs
-        if len(fit_addrs) > FIT_SAMPLE:
-            rng2 = np.random.default_rng(99)
-            idx2 = rng2.choice(len(fit_addrs), size=FIT_SAMPLE, replace=False)
-            fit_addrs = [fit_addrs[i] for i in idx2]
+    s1_addr_mat: Optional[sp.csr_matrix] = None
+    addr_vec: Optional[TfidfVectorizer] = None
 
-        addr_vectorizer = TfidfVectorizer(
-            analyzer="word",
-            ngram_range=(1, 1),   # unigram only for address
-            min_df=3,
-            max_df=0.9,
-            max_features=50_000,
-            sublinear_tf=True,
-            dtype=np.float32,
+    if use_addr:
+        print(f"  [Blocking] Fitting Address TF-IDF on {min(n_other, FIT_SAMPLE):,} samples...")
+        rng2 = np.random.default_rng(99)
+        sidx2 = rng2.choice(n_other, size=min(n_other, FIT_SAMPLE), replace=False)
+        fit_addrs = [other_addrs[i] for i in sidx2]
+        addr_vec = TfidfVectorizer(
+            analyzer="word", ngram_range=(1, 1),
+            min_df=3, max_df=0.9, max_features=50_000,
+            sublinear_tf=True, dtype=np.float32,
         )
-        addr_vectorizer.fit(fit_addrs)
-        del fit_addrs
+        addr_vec.fit(fit_addrs)
+        del fit_addrs, sidx2
         gc.collect()
 
-        s1_addr_mat = addr_vectorizer.transform(s1_addrs)
-        other_addr_mat = addr_vectorizer.transform(other_addrs)
+        print(f"  [Blocking] Transforming S1 addresses ({n_s1:,} rows)...")
+        s1_addr_mat = addr_vec.transform(s1_addrs)
         gc.collect()
 
     # ------------------------------------------------------------------
-    # 4. Numeric/Postal exact-match index
+    # 4. Numeric / postal index on other_df
     # ------------------------------------------------------------------
-    print(f"  [Blocking] Building numeric/postal anchor index...")
-    numeric_index = _build_numeric_index(other_df, id_col, actual_addr)
-    # Map other entity ID -> positional index in other_ids list
+    print(f"  [Blocking] Building numeric anchor index...")
+    numeric_idx = _build_numeric_index(other_df, id_col, actual_addr)
     other_id_to_pos = {eid: pos for pos, eid in enumerate(other_ids)}
 
     # ------------------------------------------------------------------
-    # 5. Batch cosine similarity: Name channel
+    # 5. Sharded cosine similarity — Name channel
+    #    other_names is a plain list; transform happens 100K rows at a time
     # ------------------------------------------------------------------
-    print(f"  [Blocking] Computing Name cosine similarities (sharded: q=256, i=100k)...")
-    name_topk = _batch_cosine_topk(s1_name_mat, other_name_mat, top_k * 3)
+    print(f"  [Blocking] Name channel: sharded top-K (shard=100k, qbatch=512)...")
+    name_topk = _sharded_topk(s1_name_mat, other_names, name_vec, top_k * 3)
 
     # ------------------------------------------------------------------
-    # 6. Batch cosine similarity: Address channel
+    # 6. Sharded cosine similarity — Address channel
     # ------------------------------------------------------------------
     addr_topk: List[List[Tuple[int, float]]] = [[] for _ in range(n_s1)]
-    if use_addr_channel:
-        print(f"  [Blocking] Computing Address cosine similarities (sharded)...")
-        addr_topk = _batch_cosine_topk(s1_addr_mat, other_addr_mat, top_k * 2)
+    if use_addr and addr_vec is not None and s1_addr_mat is not None:
+        print(f"  [Blocking] Address channel: sharded top-K...")
+        addr_topk = _sharded_topk(s1_addr_mat, other_addrs, addr_vec, top_k * 2)
 
     # ------------------------------------------------------------------
-    # 7. Fuse scores + numeric bonus + country filter -> top-K
+    # 7. Fuse scores + numeric bonus + country filter → top-K candidates
     # ------------------------------------------------------------------
-    print(f"  [Blocking] Fusing channels and applying country filter...")
+    print(f"  [Blocking] Fusing channels + country filter...")
     candidates: Dict[str, Set[str]] = {}
 
     for i, s1_id in enumerate(s1_ids):
         s1_country = s1_countries[i]
-        s1_addr_text = s1_addrs[i]
 
-        # Accumulate fused scores per candidate
         fused: Dict[int, float] = {}
-
         for pos, score in name_topk[i]:
             fused[pos] = fused.get(pos, 0.0) + name_weight * score
-
         for pos, score in addr_topk[i]:
             fused[pos] = fused.get(pos, 0.0) + addr_weight * score
 
-        # Numeric bonus: exact numeric token overlap
-        s1_nums = normalize.extract_numeric_tokens(s1_addr_text)
-        s1_postals = normalize.extract_postal_tokens(s1_addr_text)
-        for token in s1_nums | s1_postals:
-            if len(str(token)) < 4:
+        # Numeric bonus
+        for tok in normalize.extract_numeric_tokens(s1_addrs_raw[i]):
+            if len(tok) < 4:
                 continue
-            for match_id in numeric_index.get(str(token), []):
-                pos = other_id_to_pos.get(match_id, -1)
-                if pos >= 0:
-                    fused[pos] = fused.get(pos, 0.0) + numeric_bonus
+            for match_id in numeric_idx.get(tok, []):
+                p = other_id_to_pos.get(match_id, -1)
+                if p >= 0:
+                    fused[p] = fused.get(p, 0.0) + numeric_bonus
 
         if not fused:
             candidates[s1_id] = set()
             continue
 
-        # Country filter: hard-drop conflicting known countries
-        filtered = {}
-        for pos, score in fused.items():
-            cand_country = other_countries[pos]
-            if s1_country and cand_country and s1_country != cand_country:
-                continue  # Hard drop
-            filtered[pos] = score
+        # Country filter
+        filtered = {
+            pos: score for pos, score in fused.items()
+            if not (s1_country and other_countries[pos] and s1_country != other_countries[pos])
+        }
 
         if not filtered:
             candidates[s1_id] = set()
             continue
 
-        # Minimum score gate + top-K
-        sorted_cands = sorted(filtered.items(), key=lambda x: x[1], reverse=True)
-        max_score = sorted_cands[0][1]
+        sorted_c = sorted(filtered.items(), key=lambda x: x[1], reverse=True)
+        max_sc = sorted_c[0][1]
 
-        if max_score < min_score:
+        if max_sc < min_score:
             candidates[s1_id] = set()
             continue
 
-        # Dynamic floor: keep candidates within 40% of top score
-        floor = max(min_score, max_score * 0.40)
-        selected = {
+        floor = max(min_score, max_sc * 0.40)
+        candidates[s1_id] = {
             other_ids[pos]
-            for pos, score in sorted_cands[:top_k]
-            if score >= floor
+            for pos, sc in sorted_c[:top_k]
+            if sc >= floor
         }
-        candidates[s1_id] = selected
 
     return candidates
 
@@ -362,20 +319,15 @@ class RecallResult(float):
 def measure_recall(
     candidates: Dict[str, Iterable[str]],
     ground_truth: Dict[str, set],
-) -> RecallResult:
-    """Calculate recall ceiling, average candidates per entity, and total candidate count."""
-    total_true = 0
-    total_found = 0
+) -> "RecallResult":
+    total_true = total_found = 0
     cand_counts = []
-
     for s1_id, truth in ground_truth.items():
         cand = set(candidates.get(s1_id, ()))
         cand_counts.append(len(cand))
-        if not truth:
-            continue
-        total_true += len(truth)
-        total_found += len(truth & cand)
-
+        if truth:
+            total_true += len(truth)
+            total_found += len(truth & cand)
     recall = total_found / total_true if total_true else 1.0
     res = RecallResult(recall)
     res.avg_candidates = sum(cand_counts) / len(cand_counts) if cand_counts else 0.0
